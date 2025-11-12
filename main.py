@@ -5,4 +5,4 @@ if __name__ == "__main__":
 
 
     #ver 12.11.2025 1:26
-#upd git setting comp
+#upd git connect
