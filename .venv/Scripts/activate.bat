@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Users\1\iCloudDrive\Desktop\Asrtras ALOR\.venv
+set VIRTUAL_ENV=C:\Users\1\Desktop\Astras-ALOR\.venv
 
 if not defined PROMPT set PROMPT=$P$G
 
