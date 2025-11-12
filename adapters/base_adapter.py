@@ -58,7 +58,7 @@ class ExchangeAdapter(ABC):
 
     # ---------- Orders / Positions / Summaries (WS) ----------
     @abstractmethod
-    async def subscribe_orders(
+    async def subscribe_orders(  # NEW
         self,
         symbols: List[str],
         on_data: Callable[[Order], Any],
@@ -68,7 +68,7 @@ class ExchangeAdapter(ABC):
         ...
 
     @abstractmethod
-    async def subscribe_positions(
+    async def subscribe_positions(  # NEW
         self,
         symbols: List[str],
         on_data: Callable[[Position], Any],
@@ -78,7 +78,7 @@ class ExchangeAdapter(ABC):
         ...
 
     @abstractmethod
-    async def subscribe_summaries(
+    async def subscribe_summaries(  # NEW
         self,
         on_data: Callable[[dict], Any],
         stop_event: Any,
@@ -115,6 +115,6 @@ class ExchangeAdapter(ABC):
 
     # ---------- Market trades (AllTrades via REST) ----------
     @abstractmethod
-    async def get_all_trades(self, exchange: str, symbol: str, limit: int) -> List[TradeSlim]:
+    async def get_all_trades(self, exchange: str, symbol: str, limit: int) -> List[TradeSlim]:  # NEW
         """Рыночная лента сделок через REST (Slim: {id,symbol,price,qty,side,ts})."""
         ...

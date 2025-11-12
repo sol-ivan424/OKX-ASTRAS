@@ -32,7 +32,7 @@ class MockAdapter:
                 "priceMin": 50.0, "priceMax": 100.0,
             },
         }
-        # Портфель/сводка для WS summaries
+        # NEW: состояние для summaries
         self._cash_free = 1_000.0
         self._pnl = 0.0
 
@@ -155,7 +155,7 @@ class MockAdapter:
             asyncio.create_task(_pump(s))
 
     # ---------- ORDERS (WS) ----------
-    async def subscribe_orders(
+    async def subscribe_orders(  # NEW
         self, symbols: List[str], on_data: Callable[[Order], Any], stop_event: asyncio.Event
     ) -> None:
         """Эмуляция WS-потока заявок пользователя (Orders). Формат = наша схема Order."""
@@ -163,7 +163,6 @@ class MockAdapter:
 
         async def _pump(sym: str):
             while not stop_event.is_set():
-                # случайное событие: новая/частично/отмена/исполнена
                 ev = random.choice(["new", "partially_filled", "canceled", "filled"])
                 oid = f"mock-{random.randint(1, 9999)}"
                 price = round(random.uniform(95, 105), 2)
@@ -193,7 +192,7 @@ class MockAdapter:
             asyncio.create_task(_pump(s))
 
     # ---------- POSITIONS (WS) ----------
-    async def subscribe_positions(
+    async def subscribe_positions(  # NEW
         self, symbols: List[str], on_data: Callable[[Position], Any], stop_event: asyncio.Event
     ) -> None:
         """Эмуляция WS-потока позиций. Формат = наша схема Position."""
@@ -204,14 +203,12 @@ class MockAdapter:
             avg = None
             pnl = 0.0
             while not stop_event.is_set():
-                # немного колеблем позицию
                 delta = round(random.uniform(-0.02, 0.02), 4)
                 qty = round(max(0.0, qty + delta), 4)
                 if qty > 0 and avg is None:
                     avg = round(random.uniform(95, 105), 2)
                 if qty == 0:
                     avg = None
-                # PnL как шум около нуля
                 pnl = round(pnl + random.uniform(-1, 1), 2)
                 await on_data(Position(symbol=sym, qty=qty, avgPrice=avg, pnl=pnl, ts=now_ms()))
                 await asyncio.sleep(2)
@@ -220,15 +217,13 @@ class MockAdapter:
             asyncio.create_task(_pump(s))
 
     # ---------- SUMMARIES (WS) ----------
-    async def subscribe_summaries(
+    async def subscribe_summaries(  # NEW
         self, on_data: Callable[[dict], Any], stop_event: asyncio.Event
     ) -> None:
-        """Эмуляция WS-потока клиентской сводки (Summaries). Отдаём совместимую структуру:
-           balances[] + агрегаты (cash, equity, pnl) в Slim-духе."""
+        """Эмуляция WS-потока клиентской сводки (Summaries)."""
         cash = self._cash_free
         pnl = self._pnl
         while not stop_event.is_set():
-            # имитируем небольшие изменения
             pnl = round(pnl + random.uniform(-3, 3), 2)
             cash = round(cash + random.uniform(-5, 5), 2)
             data = {
@@ -279,13 +274,11 @@ class MockAdapter:
             bars.append({"t": t, "c": 101.0, "o": 100.0, "h": 102.0, "l": 99.0, "v": 12.3})
         return bars
 
-    # ---------- NEW: рыночная лента через REST-путь (Slim) ----------
-    async def get_all_trades(self, exchange: str, symbol: str, limit: int) -> List[TradeSlim]:
+    # ---------- Market trades via REST (Slim) ----------
+    async def get_all_trades(self, exchange: str, symbol: str, limit: int) -> List[TradeSlim]:  # NEW
         """
-        MOCK-реализация. Для реальной интеграции сделать AlorAdapter,
-        который вызовет HTTP:
-          /md/v2/securities/{exchange}/{symbol}/alltrades?limit=...
-        и вернёт Slim-массив [{id, symbol, price, qty, side, ts}, ...]
+        MOCK-реализация. Для реальной интеграции сделать OkxAdapter/AlorAdapter,
+        который вызовет HTTP-API и вернёт Slim-массив [{id, symbol, price, qty, side, ts}, ...]
         """
         out: List[TradeSlim] = []
         for _ in range(limit):

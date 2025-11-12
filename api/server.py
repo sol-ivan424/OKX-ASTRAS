@@ -1,12 +1,23 @@
+import os  # NEW
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import List
 import asyncio
 
 from api.schemas import Order
 from adapters.mock_adapter import MockAdapter
+# from adapters.okx_adapter import OkxAdapter  # NOTE: подключим, когда появится файл
+
+# NEW: фабрика выбора адаптера по переменной окружения
+def _make_adapter():
+    name = os.getenv("ADAPTER", "mock").lower()
+    if name == "okx":
+        # NOTE: раскомментировать после добавления OkxAdapter
+        # return OkxAdapter(...)
+        raise RuntimeError("OkxAdapter is not wired yet")
+    return MockAdapter()
 
 app = FastAPI(title="Astras Crypto Gateway")
-adapter = MockAdapter()
+adapter = _make_adapter()
 
 # ---------- helpers: нормализация к Simple-формату Astras ----------
 def _to_simple_full(d: dict) -> dict:
@@ -91,15 +102,15 @@ async def cancel(oid: str, symbol: str):
 async def stream(ws: WebSocket):
     await ws.accept()
 
-    # Реестр активных подписок по топикам
+    # CHANGED: добавили новые топики, 'trades' (рыночный) отсутствует по WS
     active: dict[str, list[asyncio.Event]] = {
         "instruments": [],
         "quotes": [],
         "book": [],
         "fills": [],
-        "orders": [],
-        "positions": [],
-        "summaries": [],
+        "orders": [],      # NEW
+        "positions": [],   # NEW
+        "summaries": [],   # NEW
     }
 
     async def send_wrapped(name: str, payload, guid: str | None = None):
@@ -148,7 +159,7 @@ async def stream(ws: WebSocket):
                     await ws.send_json({"data": d, "guid": req_guid or "fills:req"})
                 asyncio.create_task(adapter.subscribe_fills(symbols, lambda x: asyncio.create_task(on_fill(x)), stop))
 
-            elif topic == "orders":
+            elif topic == "orders":  # NEW
                 stop = asyncio.Event()
                 active["orders"].append(stop)
 
@@ -156,7 +167,7 @@ async def stream(ws: WebSocket):
                     await send_wrapped("orders", o, req_guid or f"orders:{o.symbol}")
                 asyncio.create_task(adapter.subscribe_orders(symbols, lambda o: asyncio.create_task(on_order(o)), stop))
 
-            elif topic == "positions":
+            elif topic == "positions":  # NEW
                 stop = asyncio.Event()
                 active["positions"].append(stop)
 
@@ -164,7 +175,7 @@ async def stream(ws: WebSocket):
                     await send_wrapped("positions", p, req_guid or f"positions:{p.symbol}")
                 asyncio.create_task(adapter.subscribe_positions(symbols, lambda p: asyncio.create_task(on_pos(p)), stop))
 
-            elif topic == "summaries":
+            elif topic == "summaries":  # NEW
                 stop = asyncio.Event()
                 active["summaries"].append(stop)
 
@@ -200,6 +211,6 @@ async def stream(ws: WebSocket):
 
 
 
-                                                    #котировки; bid - цена по которой кто-то готов купить; ask - цена ... продать
-                                                    #стакан
-                                                    #сделки: fills по WS; AllTrades по REST
+                                                    # котировки; bid - цена по которой кто-то готов купить; ask - цена ... продать
+                                                    # стакан
+                                                    # сделки: fills по WS; AllTrades по REST
