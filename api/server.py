@@ -60,6 +60,13 @@ async def account():
 async def positions():
     return [p.dict() for p in await adapter.get_positions()]
 
+# NEW: рыночная лента сделок через REST (Slim)
+@app.get("/trades")
+async def trades(symbol: str, exchange: str = "MOCK", limit: int = 100):
+    items = await adapter.get_all_trades(exchange, symbol, min(max(limit, 1), 1000))
+    out = [it.dict() if hasattr(it, "dict") else it for it in items]
+    return {"data": out, "guid": f"alltrades:{exchange}:{symbol}"}
+
 @app.post("/orders")
 async def place(o: dict):
     order = Order(
@@ -83,82 +90,116 @@ async def cancel(oid: str, symbol: str):
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
     await ws.accept()
-    active = {"instruments": None}  # asyncio.Event
 
-    async def send_wrapped(name: str, payload):
+    # Реестр активных подписок по топикам
+    active: dict[str, list[asyncio.Event]] = {
+        "instruments": [],
+        "quotes": [],
+        "book": [],
+        "fills": [],
+        "orders": [],
+        "positions": [],
+        "summaries": [],
+    }
+
+    async def send_wrapped(name: str, payload, guid: str | None = None):
         data = payload.dict() if hasattr(payload, "dict") else payload
-        sym = data.get("symbol") or data.get("sym") or "multi"
-        await ws.send_json({"data": data, "guid": f"{name}:{sym}"})
+        await ws.send_json({"data": data, "guid": guid or f"{name}:req"})
 
     try:
         while True:
             msg = await ws.receive_json()
-            stream = msg.get("stream")
+            topic = msg.get("stream")
             symbols: List[str] = msg.get("symbols", [])
+            req_guid = msg.get("guid")
 
-            if stream == "quotes":
-                await adapter.subscribe_quotes(
-                    symbols, lambda d: asyncio.create_task(send_wrapped("quotes", d))
-                )
+            # ---- subscribe handlers ----
+            if topic == "instruments":
+                stop = asyncio.Event()
+                active["instruments"].append(stop)
 
-            elif stream == "book":
-                await adapter.subscribe_order_book(
-                    symbols, lambda d: asyncio.create_task(send_wrapped("book", d))
-                )
+                async def send_inst(raw: dict):
+                    await ws.send_json({"data": _to_simple_full(raw), "guid": req_guid or "instruments:req"}) \
+                        if "exchange" in raw or "ex" in raw else \
+                        await ws.send_json({"data": _to_simple_delta(raw), "guid": req_guid or "instruments:req"})
+                asyncio.create_task(adapter.stream_instruments(symbols, send_inst, stop))
 
-            elif stream == "trades":
-                await adapter.subscribe_trades(
-                    symbols, lambda d: asyncio.create_task(send_wrapped("trades", d))
-                )
+            elif topic == "quotes":
+                stop = asyncio.Event()
+                active["quotes"].append(stop)
 
-            elif stream == "bars":
+                async def on_quote(q):
+                    await send_wrapped("quotes", q, req_guid or f"quotes:{q.symbol}")
+                asyncio.create_task(adapter.subscribe_quotes(symbols, lambda q: asyncio.create_task(on_quote(q)), stop))
+
+            elif topic == "book":
+                stop = asyncio.Event()
+                active["book"].append(stop)
+
+                async def on_book(b):
+                    await send_wrapped("book", b, req_guid or f"book:{b.symbol}")
+                asyncio.create_task(adapter.subscribe_order_book(symbols, lambda b: asyncio.create_task(on_book(b)), stop))
+
+            elif topic == "fills":
+                stop = asyncio.Event()
+                active["fills"].append(stop)
+
+                async def on_fill(d: dict):
+                    await ws.send_json({"data": d, "guid": req_guid or "fills:req"})
+                asyncio.create_task(adapter.subscribe_fills(symbols, lambda x: asyncio.create_task(on_fill(x)), stop))
+
+            elif topic == "orders":
+                stop = asyncio.Event()
+                active["orders"].append(stop)
+
+                async def on_order(o):
+                    await send_wrapped("orders", o, req_guid or f"orders:{o.symbol}")
+                asyncio.create_task(adapter.subscribe_orders(symbols, lambda o: asyncio.create_task(on_order(o)), stop))
+
+            elif topic == "positions":
+                stop = asyncio.Event()
+                active["positions"].append(stop)
+
+                async def on_pos(p):
+                    await send_wrapped("positions", p, req_guid or f"positions:{p.symbol}")
+                asyncio.create_task(adapter.subscribe_positions(symbols, lambda p: asyncio.create_task(on_pos(p)), stop))
+
+            elif topic == "summaries":
+                stop = asyncio.Event()
+                active["summaries"].append(stop)
+
+                async def on_sum(d: dict):
+                    await ws.send_json({"data": d, "guid": req_guid or "summaries:req"})
+                asyncio.create_task(adapter.subscribe_summaries(lambda d: asyncio.create_task(on_sum(d)), stop))
+
+            elif topic == "bars":
+                # разовая выборка — без регистрации в active
                 tf = msg.get("tf", "1m")
                 limit = int(msg.get("limit", 50))
                 sym = symbols[0] if symbols else "UNKNOWN"
                 bars = await adapter.get_history(sym, tf, min(limit, 100))
                 for b in bars:
-                    await ws.send_json({"data": b, "guid": f"bars:{sym}"})
+                    await ws.send_json({"data": b, "guid": req_guid or f"bars:{sym}"})
 
-            elif stream == "instruments":
-                # остановим прошлую подписку
-                if active["instruments"] is not None:
-                    active["instruments"].set()
-                    active["instruments"] = None
+            elif topic == "unsubscribe":
+                # можно прислать topic (конкретный) или опустить (отписка от всех)
+                which = msg.get("topic")  # any from active keys | None
+                targets = [which] if which in active else list(active.keys())
+                for t in targets:
+                    for ev in active[t]:
+                        ev.set()
+                    active[t].clear()
+                await ws.send_json({"data": {"ok": True, "unsubscribed": targets}, "guid": req_guid or "unsub:ok"})
 
-                req_guid = msg.get("guid") or "instruments:req"
-                stop_event = asyncio.Event()
-                active["instruments"] = stop_event
-
-                # помним, по каким символам уже отправили FULL
-                seen_full = set()
-
-                async def send_inst(raw: dict):
-                    sym = raw.get("symbol") or raw.get("sym")
-                    if sym not in seen_full:
-                        payload = _to_simple_full(raw)   # первое сообщение — FULL
-                        seen_full.add(sym)
-                    else:
-                        payload = _to_simple_delta(raw)  # далее — DELTA
-                    await ws.send_json({"data": payload, "guid": req_guid})
-
-                asyncio.create_task(adapter.stream_instruments(symbols, send_inst, stop_event))
-
-            elif stream == "unsubscribe":
-                if msg.get("topic") == "instruments" and active["instruments"] is not None:
-                    active["instruments"].set()
-                    active["instruments"] = None
-                    await ws.send_json({"data": {"ok": True}, "guid": "instruments:unsub"})
-
+            # неизвестный stream — игнор
     except WebSocketDisconnect:
-        if active["instruments"] is not None:
-            active["instruments"].set()
-
-
-
-
+        # отписываемся от всего при разрыве
+        for lst in active.values():
+            for ev in lst:
+                ev.set()
 
 
 
                                                     #котировки; bid - цена по которой кто-то готов купить; ask - цена ... продать
                                                     #стакан
-                                                    #сделки
+                                                    #сделки: fills по WS; AllTrades по REST

@@ -85,11 +85,13 @@ class BookSlim(BaseModel):     # стакан
     ts: int
 
 class TradeSlim(BaseModel):    # сделки (лента)
+    id: Optional[str] = None   # идентификатор сделки (рекомендовано для Astras)
     symbol: str
     price: float
-    size: float
+    qty: float                 # ОБЯЗАТЕЛЬНО: Astras ждёт qty (а не size)
     side: Literal["buy","sell"]
     ts: int
+
 
 class InstrumentAlor(BaseModel):  # минимально совместимо с Astras/ALOR
     symbol: str            # "BTC-USDT"
@@ -98,3 +100,27 @@ class InstrumentAlor(BaseModel):  # минимально совместимо с
     lotSize: float
     tickSize: float
     type: str = "SPOT"
+
+
+from pydantic import BaseModel
+from typing import Optional
+
+class PortfolioTrade(BaseModel):
+    id: str
+    orderno: str
+    comment: Optional[str] = None
+    symbol: str
+    brokerSymbol: str
+    exchange: str
+    date: str                 # ISO8601 '2023-12-29T12:35:06.0000000Z'
+    board: str
+    qtyUnits: int
+    qtyBatch: int
+    qty: int
+    price: float
+    accruedInt: float
+    side: str                 # "buy" | "sell"
+    existing: bool
+    commission: float
+    repoSpecificFields: Optional[dict] = None
+    volume: float
