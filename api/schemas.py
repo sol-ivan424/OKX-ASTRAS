@@ -2,6 +2,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Literal, Tuple
 import time
 
+
 Side = Literal["buy", "sell"]
 OrderType = Literal["limit", "market", "stop", "stop_limit"]
 TimeInForce = Literal["GTC", "IOC", "FOK"]
@@ -61,9 +62,6 @@ def now_ms() -> int:
 
 #ДОБАВИЛИ
 
-from pydantic import BaseModel
-from typing import Optional, List, Tuple, Literal
-
 class BarSlim(BaseModel):      # свеча для /history
     t: int
     o: float
@@ -72,11 +70,47 @@ class BarSlim(BaseModel):      # свеча для /history
     c: float
     v: float
 
-class QuoteSlim(BaseModel):    # котировки (best bid/ask)
-    symbol: str
-    bid: Optional[float]
-    ask: Optional[float]
-    ts: int
+# --- КОТИРОВКИ (SLIM) ---
+
+class QuoteSlim(BaseModel):
+    # Обязательные поля
+    sym: str                  # тикер, например "SBER" или "BTC-USDT"
+    ex: Optional[str] = None  # биржа, "MOEX", "SPBX", "MOCK" и т.п.
+    desc: Optional[str] = None  # описание инструмента
+
+    tst: int                  # timestamp последних торгов (Unix seconds)
+    tso: Optional[int] = None # время начала сессии (если есть)
+
+    # Цены OHLC
+    o: Optional[float] = None # open
+    h: Optional[float] = None # high
+    l: Optional[float] = None # low
+    c: Optional[float] = None # close / last
+
+    # Объёмы и открытый интерес
+    v: Optional[float] = None     # объём текущей сессии
+    acci: Optional[float] = None  # накопленный доход/купон и т.п.
+    oi: Optional[float] = None    # open interest
+    y: Optional[float] = None     # вчерашняя цена закрытия (или аналог)
+
+    # Стакан по лучшей цене
+    ask: Optional[float] = None   # лучшая цена продавца
+    bid: Optional[float] = None   # лучшая цена покупателя
+    av: Optional[float] = None    # объём на лучшем ask
+    bv: Optional[float] = None    # объём на лучшем bid
+
+    # Суммарные объёмы
+    tbv: Optional[float] = None   # суммарный bid volume
+    tav: Optional[float] = None   # суммарный ask volume
+
+    # Лотность
+    lot: Optional[float] = None   # размер лота
+    lotv: Optional[float] = None  # объём в лотах (или денежный эквивалент)
+
+    # Прочее
+    fv: Optional[float] = None    # шаг цены / face value / etc. (зависит от рынка)
+    t: Optional[str] = None       # тип котировки/торговой сессии, например "C5"
+
 
 class BookSlim(BaseModel):     # стакан
     symbol: str
@@ -101,9 +135,6 @@ class InstrumentAlor(BaseModel):  # минимально совместимо с
     tickSize: float
     type: str = "SPOT"
 
-
-from pydantic import BaseModel
-from typing import Optional
 
 class PortfolioTrade(BaseModel):
     id: str

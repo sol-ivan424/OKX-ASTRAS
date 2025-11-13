@@ -102,15 +102,14 @@ async def cancel(oid: str, symbol: str):
 async def stream(ws: WebSocket):
     await ws.accept()
 
-    # CHANGED: добавили новые топики, 'trades' (рыночный) отсутствует по WS
     active: dict[str, list[asyncio.Event]] = {
         "instruments": [],
         "quotes": [],
         "book": [],
         "fills": [],
-        "orders": [],      # NEW
-        "positions": [],   # NEW
-        "summaries": [],   # NEW
+        "orders": [],
+        "positions": [],
+        "summaries": [],
     }
 
     async def send_wrapped(name: str, payload, guid: str | None = None):
@@ -130,9 +129,11 @@ async def stream(ws: WebSocket):
                 active["instruments"].append(stop)
 
                 async def send_inst(raw: dict):
-                    await ws.send_json({"data": _to_simple_full(raw), "guid": req_guid or "instruments:req"}) \
-                        if "exchange" in raw or "ex" in raw else \
+                    if "exchange" in raw or "ex" in raw:
+                        await ws.send_json({"data": _to_simple_full(raw), "guid": req_guid or "instruments:req"})
+                    else:
                         await ws.send_json({"data": _to_simple_delta(raw), "guid": req_guid or "instruments:req"})
+
                 asyncio.create_task(adapter.stream_instruments(symbols, send_inst, stop))
 
             elif topic == "quotes":
@@ -140,8 +141,16 @@ async def stream(ws: WebSocket):
                 active["quotes"].append(stop)
 
                 async def on_quote(q):
-                    await send_wrapped("quotes", q, req_guid or f"quotes:{q.symbol}")
-                asyncio.create_task(adapter.subscribe_quotes(symbols, lambda q: asyncio.create_task(on_quote(q)), stop))
+                    # ❗ тут было q.symbol — теперь у QuoteSlim поле sym
+                    await send_wrapped("quotes", q, req_guid or f"quotes:{q.sym}")
+
+                asyncio.create_task(
+                    adapter.subscribe_quotes(
+                        symbols,
+                        lambda q: asyncio.create_task(on_quote(q)),
+                        stop,
+                    )
+                )
 
             elif topic == "book":
                 stop = asyncio.Event()
@@ -208,9 +217,3 @@ async def stream(ws: WebSocket):
         for lst in active.values():
             for ev in lst:
                 ev.set()
-
-
-
-                                                    # котировки; bid - цена по которой кто-то готов купить; ask - цена ... продать
-                                                    # стакан
-                                                    # сделки: fills по WS; AllTrades по REST

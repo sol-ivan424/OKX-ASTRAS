@@ -10,8 +10,15 @@ from api.schemas import (
     Order, AccountInfo, Position
 )
 
+
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def now_sec() -> int:
+    """Unix-время в секундах (для поля tst в Slim-котировках)."""
+    return int(time.time())
+
 
 def iso_now_7() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
@@ -32,7 +39,7 @@ class MockAdapter:
                 "priceMin": 50.0, "priceMax": 100.0,
             },
         }
-        # NEW: состояние для summaries
+        # состояние для summaries
         self._cash_free = 1_000.0
         self._pnl = 0.0
 
@@ -78,23 +85,100 @@ class MockAdapter:
 
     # ---------- QUOTES / BOOK (public) ----------
     async def subscribe_quotes(
-        self, symbols: List[str], on_data: Callable[[QuoteSlim], None], stop_event: Optional[asyncio.Event] = None
+        self,
+        symbols: List[str],
+        on_data: Callable[[QuoteSlim], None],
+        stop_event: Optional[asyncio.Event] = None,
     ) -> None:
+        """
+        Эмуляция WS-потока котировок в формате Astras/Alor Slim.
+
+        Формат JSON, который увидит Astras:
+        {
+          "guid": "quotes:BTC-USDT",
+          "data": {
+            "sym": "BTC-USDT",
+            "ex": "MOCK",
+            "desc": "Mock instrument BTC-USDT",
+            "tst": 1702844426,
+            "tso": null,
+            "o": 100.12,
+            "h": 101.05,
+            "l": 99.50,
+            "c": 100.80,
+            "v": 1000,
+            "acci": 0,
+            "oi": null,
+            "y": null,
+            "ask": 101.09,
+            "bid": 100.03,
+            "av": 100,
+            "bv": 120,
+            "tbv": 1000,
+            "tav": 900,
+            "lot": 1,
+            "lotv": 100.03,
+            "fv": 1,
+            "t": "C5"
+          }
+        }
+        """
         syms = symbols or list(self._inst_state.keys())
 
         async def _pump(sym: str):
+            mid = 100.0
             while not (stop_event and stop_event.is_set()):
-                ts = now_ms()
-                bid = round(random.uniform(99, 101), 2)
-                ask = round(bid + random.uniform(0.5, 1.5), 2)
-                on_data(QuoteSlim(symbol=sym, bid=bid, ask=ask, ts=ts))
+                # небольшой дрейф вокруг 100
+                mid += random.uniform(-0.5, 0.5)
+                spread = random.uniform(0.2, 1.0)
+
+                bid = round(mid - spread / 2, 2)
+                ask = round(mid + spread / 2, 2)
+
+                quote = QuoteSlim(
+                    sym=sym,
+                    ex="MOCK",
+                    desc=f"Mock instrument {sym}",
+                    tst=now_sec(),
+                    tso=None,
+
+                    # OHLC — делаем консистентные mock-значения
+                    o=round(mid - 0.5, 2),
+                    h=round(mid + 0.5, 2),
+                    l=round(mid - 1.0, 2),
+                    c=round(mid, 2),
+
+                    v=1000,
+                    acci=0,
+                    oi=None,
+                    y=None,
+
+                    ask=ask,
+                    bid=bid,
+                    av=100,
+                    bv=120,
+
+                    tbv=1000,
+                    tav=900,
+
+                    lot=1,
+                    lotv=round(bid, 2),
+
+                    fv=1,
+                    t="C5",
+                )
+
+                on_data(quote)
                 await asyncio.sleep(2)
 
         for s in syms:
             asyncio.create_task(_pump(s))
 
     async def subscribe_order_book(
-        self, symbols: List[str], on_data: Callable[[BookSlim], None], stop_event: Optional[asyncio.Event] = None
+        self,
+        symbols: List[str],
+        on_data: Callable[[BookSlim], None],
+        stop_event: Optional[asyncio.Event] = None,
     ) -> None:
         syms = symbols or list(self._inst_state.keys())
 
@@ -103,8 +187,14 @@ class MockAdapter:
             while not (stop_event and stop_event.is_set()):
                 ts = now_ms()
                 mid += random.uniform(-0.5, 0.5)
-                bids = [(round(mid - i*0.1, 2), round(random.uniform(0.5, 2.0), 3)) for i in range(1, 6)]
-                asks = [(round(mid + i*0.1, 2), round(random.uniform(0.5, 2.0), 3)) for i in range(1, 6)]
+                bids = [
+                    (round(mid - i * 0.1, 2), round(random.uniform(0.5, 2.0), 3))
+                    for i in range(1, 6)
+                ]
+                asks = [
+                    (round(mid + i * 0.1, 2), round(random.uniform(0.5, 2.0), 3))
+                    for i in range(1, 6)
+                ]
                 on_data(BookSlim(symbol=sym, bids=bids, asks=asks, ts=ts))
                 await asyncio.sleep(2)
 
@@ -113,7 +203,10 @@ class MockAdapter:
 
     # ---------- ПОРТФЕЛЬНЫЕ СДЕЛКИ / EXECUTIONS (fills) ----------
     async def subscribe_fills(
-        self, symbols: List[str], on_data: Callable[[dict], Any], stop_event: asyncio.Event
+        self,
+        symbols: List[str],
+        on_data: Callable[[dict], Any],
+        stop_event: asyncio.Event,
     ) -> None:
         syms = symbols or ["BTC-USDT"]
 
@@ -155,15 +248,20 @@ class MockAdapter:
             asyncio.create_task(_pump(s))
 
     # ---------- ORDERS (WS) ----------
-    async def subscribe_orders(  # NEW
-        self, symbols: List[str], on_data: Callable[[Order], Any], stop_event: asyncio.Event
+    async def subscribe_orders(
+        self,
+        symbols: List[str],
+        on_data: Callable[[Order], Any],
+        stop_event: asyncio.Event,
     ) -> None:
         """Эмуляция WS-потока заявок пользователя (Orders). Формат = наша схема Order."""
         syms = symbols or list(self._inst_state.keys())
 
         async def _pump(sym: str):
             while not stop_event.is_set():
-                ev = random.choice(["new", "partially_filled", "canceled", "filled"])
+                ev = random.choice(
+                    ["new", "partially_filled", "canceled", "filled"]
+                )
                 oid = f"mock-{random.randint(1, 9999)}"
                 price = round(random.uniform(95, 105), 2)
                 qty = round(random.uniform(0.01, 0.2), 4)
@@ -192,8 +290,11 @@ class MockAdapter:
             asyncio.create_task(_pump(s))
 
     # ---------- POSITIONS (WS) ----------
-    async def subscribe_positions(  # NEW
-        self, symbols: List[str], on_data: Callable[[Position], Any], stop_event: asyncio.Event
+    async def subscribe_positions(
+        self,
+        symbols: List[str],
+        on_data: Callable[[Position], Any],
+        stop_event: asyncio.Event,
     ) -> None:
         """Эмуляция WS-потока позиций. Формат = наша схема Position."""
         syms = symbols or list(self._inst_state.keys())
@@ -210,15 +311,19 @@ class MockAdapter:
                 if qty == 0:
                     avg = None
                 pnl = round(pnl + random.uniform(-1, 1), 2)
-                await on_data(Position(symbol=sym, qty=qty, avgPrice=avg, pnl=pnl, ts=now_ms()))
+                await on_data(
+                    Position(symbol=sym, qty=qty, avgPrice=avg, pnl=pnl, ts=now_ms())
+                )
                 await asyncio.sleep(2)
 
         for s in syms:
             asyncio.create_task(_pump(s))
 
     # ---------- SUMMARIES (WS) ----------
-    async def subscribe_summaries(  # NEW
-        self, on_data: Callable[[dict], Any], stop_event: asyncio.Event
+    async def subscribe_summaries(
+        self,
+        on_data: Callable[[dict], Any],
+        stop_event: asyncio.Event,
     ) -> None:
         """Эмуляция WS-потока клиентской сводки (Summaries)."""
         cash = self._cash_free
@@ -242,8 +347,15 @@ class MockAdapter:
     async def place_order(self, o: Order) -> Order:
         oid = f"mock-{len(self._orders) + 1}"
         created = Order(
-            id=oid, symbol=o.symbol, side=o.side, type=o.type, price=o.price,
-            quantity=o.quantity, status="new", filledQuantity=0.0, ts=now_ms()
+            id=oid,
+            symbol=o.symbol,
+            side=o.side,
+            type=o.type,
+            price=o.price,
+            quantity=o.quantity,
+            status="new",
+            filledQuantity=0.0,
+            ts=now_ms(),
         )
         self._orders[oid] = created
         return created
@@ -252,18 +364,30 @@ class MockAdapter:
         o = self._orders.get(order_id)
         if not o:
             o = Order(
-                id=order_id, symbol=symbol, side="buy", type="limit",
-                price=None, quantity=0.0, status="canceled", filledQuantity=0.0, ts=now_ms()
+                id=order_id,
+                symbol=symbol,
+                side="buy",
+                type="limit",
+                price=None,
+                quantity=0.0,
+                status="canceled",
+                filledQuantity=0.0,
+                ts=now_ms(),
             )
         else:
             o.status = "canceled"
         return o
 
     async def get_account_info(self) -> AccountInfo:
-        return AccountInfo(balances=[{"asset": "USDT", "free": 1000.0, "locked": 0.0}], ts=now_ms())
+        return AccountInfo(
+            balances=[{"asset": "USDT", "free": 1000.0, "locked": 0.0}],
+            ts=now_ms(),
+        )
 
     async def get_positions(self) -> List[Position]:
-        return [Position(symbol="BTC-USDT", qty=0.0, avgPrice=None, pnl=0.0, ts=now_ms())]
+        return [
+            Position(symbol="BTC-USDT", qty=0.0, avgPrice=None, pnl=0.0, ts=now_ms())
+        ]
 
     # ---------- HISTORY ----------
     async def get_history(self, symbol: str, tf: str, limit: int) -> list:
@@ -271,11 +395,15 @@ class MockAdapter:
         bars = []
         for i in range(limit):
             t = base_s - (limit - 1 - i) * 60
-            bars.append({"t": t, "c": 101.0, "o": 100.0, "h": 102.0, "l": 99.0, "v": 12.3})
+            bars.append(
+                {"t": t, "c": 101.0, "o": 100.0, "h": 102.0, "l": 99.0, "v": 12.3}
+            )
         return bars
 
     # ---------- Market trades via REST (Slim) ----------
-    async def get_all_trades(self, exchange: str, symbol: str, limit: int) -> List[TradeSlim]:  # NEW
+    async def get_all_trades(
+        self, exchange: str, symbol: str, limit: int
+    ) -> List[TradeSlim]:
         """
         MOCK-реализация. Для реальной интеграции сделать OkxAdapter/AlorAdapter,
         который вызовет HTTP-API и вернёт Slim-массив [{id, symbol, price, qty, side, ts}, ...]
@@ -289,7 +417,7 @@ class MockAdapter:
                     price=round(random.uniform(98, 102), 2),
                     qty=round(random.uniform(0.001, 0.05), 4),
                     side=random.choice(["buy", "sell"]),
-                    ts=now_ms()
+                    ts=now_ms(),
                 )
             )
         return out
