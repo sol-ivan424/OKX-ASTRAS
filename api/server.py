@@ -156,7 +156,7 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
-            # OrderBookGetAndSubscribe (биржевой стакан)
+            # === OrderBookGetAndSubscribe (биржевой стакан) ===
             if opcode == "OrderBookGetAndSubscribe":
                 stop = asyncio.Event()
                 active["book"].append(stop)
@@ -194,11 +194,61 @@ async def stream(ws: WebSocket):
                             stop,
                         )
                     )
-                # opcode уже обработали, дальше по topic не идём
+                continue
+
+            # === QuotesSubscribe (котировки по opcode) ===
+            if opcode == "QuotesSubscribe":
+                stop = asyncio.Event()
+                active["quotes"].append(stop)
+
+                code = msg.get("code")
+                group = msg.get("instrumentGroup")
+                # Маппинг code+group → symbol. Для mock можно просто взять code.
+                # Если захочешь строгий маппинг, можно сделать: f"{code}-{group}"
+                symbol = code or (symbols[0] if symbols else "")
+
+                guid = msg.get("guid") or req_guid
+
+                async def on_quote_opcode(q):
+                    # ВАЖНО: формат ответа НЕ меняем — используем тот же, что и в topic=="quotes"
+                    await send_wrapped("quotes", q, guid or f"quotes:{getattr(q, 'symbol', '')}")
+
+                if symbol:
+                    asyncio.create_task(
+                        adapter.subscribe_quotes(
+                            [symbol],
+                            lambda q: asyncio.create_task(on_quote_opcode(q)),
+                            stop,
+                        )
+                    )
+                continue
+
+            # === TradesGetAndSubscribeV2 (fills: сделки по портфелю) ===
+            if opcode == "TradesGetAndSubscribeV2":
+                stop = asyncio.Event()
+                active["fills"].append(stop)
+
+                portfolio = msg.get("portfolio")
+                guid = msg.get("guid") or req_guid
+                _skip_history = msg.get("skipHistory", False)  # сейчас просто игнорируем
+
+                async def on_fill_opcode(fill):
+                    # Формат ответа НЕ меняем — отдаём ровно то, что шлёт адаптер
+                    await ws.send_json({
+                        "data": fill,
+                        "guid": guid
+                    })
+
+                asyncio.create_task(
+                    adapter.subscribe_fills(
+                        [portfolio] if portfolio else [],
+                        lambda f: asyncio.create_task(on_fill_opcode(f)),
+                        stop,
+                    )
+                )
                 continue
 
             # ---------- subscribe handlers по нашему "stream" протоколу ----------
-
             if topic == "instruments":
                 stop = asyncio.Event()
                 active["instruments"].append(stop)
@@ -220,8 +270,12 @@ async def stream(ws: WebSocket):
                 active["quotes"].append(stop)
 
                 async def on_quote(q):
-                    # у QuoteSlim в schemas сейчас поле sym (если поменяешь на symbol — поправь тут)
-                    await send_wrapped("quotes", q, req_guid or f"quotes:{getattr(q, 'sym', None) or getattr(q, 'symbol', '')}")
+                    await send_wrapped(
+                        "quotes",
+                        q,
+                        req_guid
+                        or f"quotes:{getattr(q, 'symbol', getattr(q, 'sym', ''))}",
+                    )
 
                 asyncio.create_task(
                     adapter.subscribe_quotes(
@@ -235,7 +289,7 @@ async def stream(ws: WebSocket):
                 stop = asyncio.Event()
                 active["book"].append(stop)
 
-                async def on_book(b):
+                async def on_book_stream(b):
                     # b — это BookSlim (symbol, bids[(price, qty)], asks[(price, qty)], ts в мс)
                     payload = {
                         "b": [
@@ -256,7 +310,7 @@ async def stream(ws: WebSocket):
                 asyncio.create_task(
                     adapter.subscribe_order_book(
                         symbols,
-                        lambda b: asyncio.create_task(on_book(b)),
+                        lambda b: asyncio.create_task(on_book_stream(b)),
                         stop,
                     )
                 )
@@ -340,7 +394,10 @@ async def stream(ws: WebSocket):
                         ev.set()
                     active[t].clear()
                 await ws.send_json(
-                    {"data": {"ok": True, "unsubscribed": targets}, "guid": req_guid or "unsub:ok"}
+                    {
+                        "data": {"ok": True, "unsubscribed": targets},
+                        "guid": req_guid or "unsub:ok",
+                    }
                 )
 
             # неизвестный stream/opcode — игнорируем
