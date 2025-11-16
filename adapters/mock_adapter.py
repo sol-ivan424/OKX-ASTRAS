@@ -400,6 +400,62 @@ class MockAdapter:
             )
         return bars
 
+    # ---------- BARS (WS: BarsGetAndSubscribe) ----------
+    async def subscribe_bars(
+        self,
+        symbol: str,
+        tf: str,
+        from_ts: int,
+        skip_history: bool,
+        split_adjust: bool,
+        on_data,
+        stop_event: asyncio.Event,
+    ) -> None:
+        """
+        Эмуляция Astras BarsGetAndSubscribe:
+        сначала отдаём историю с момента `from_ts`, затем стримим новые бары.
+        Формат баров: {t, o, h, l, c, v}.
+        """
+
+        # 1) История
+        if not skip_history:
+            try:
+                tf_sec = int(tf)
+            except Exception:
+                tf_sec = 60
+
+            t = from_ts
+            price = 100.0
+            for _ in range(200):
+                o = round(price + random.uniform(-1, 1), 2)
+                h = round(o + random.uniform(0, 1), 2)
+                l = round(o - random.uniform(0, 1), 2)
+                c = round(l + (h - l) * random.random(), 2)
+                v = random.randint(500, 5000)
+                bar = {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+
+                if stop_event.is_set():
+                    return
+
+                await on_data(bar)
+                price = c
+                t += tf_sec
+
+        # 2) Стрим
+        price = 100.0
+        while not stop_event.is_set():
+            price += random.uniform(-0.5, 0.5)
+            o = round(price - random.uniform(0, 0.5), 2)
+            h = round(price + random.uniform(0, 1), 2)
+            l = round(price - random.uniform(0, 1), 2)
+            c = round(price, 2)
+            v = random.randint(500, 5000)
+
+            bar = {"t": int(time.time()), "o": o, "h": h, "l": l, "c": c, "v": v}
+
+            await on_data(bar)
+            await asyncio.sleep(2)
+
     # ---------- Market trades via REST (Slim) ----------
     async def get_all_trades(
         self, exchange: str, symbol: str, limit: int

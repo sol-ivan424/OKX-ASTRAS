@@ -1,7 +1,9 @@
 import os
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import List
 import asyncio
+import datetime
 
 from api.schemas import Order
 from adapters.mock_adapter import MockAdapter
@@ -126,6 +128,7 @@ async def stream(ws: WebSocket):
         "orders": [],
         "positions": [],
         "summaries": [],
+        "bars": [],
     }
 
     async def send_wrapped(name: str, payload, guid: str | None = None):
@@ -153,6 +156,99 @@ async def stream(ws: WebSocket):
                         },
                         "guid": req_guid or msg.get("guid"),
                     }
+                )
+                continue
+
+            # === BarsGetAndSubscribe (история + стрим по свечам) ===
+            if opcode == "BarsGetAndSubscribe":
+                stop = asyncio.Event()
+                active["bars"].append(stop)
+
+                code = msg.get("code")
+                tf = str(msg.get("tf", "60"))
+                from_ts = int(msg.get("from", int(time.time())))
+                skip_history = bool(msg.get("skipHistory", False))
+                split_adjust = bool(msg.get("splitAdjust", True))
+                guid = msg.get("guid") or req_guid
+
+                async def on_bar(bar: dict):
+                    await ws.send_json({
+                        "data": bar,
+                        "guid": guid,
+                    })
+
+                if code:
+                    asyncio.create_task(
+                        adapter.subscribe_bars(
+                            symbol=code,
+                            tf=tf,
+                            from_ts=from_ts,
+                            skip_history=skip_history,
+                            split_adjust=split_adjust,
+                            on_data=lambda b: asyncio.create_task(on_bar(b)),
+                            stop_event=stop,
+                        )
+                    )
+                continue
+
+            # === OrdersGetAndSubscribeV2 (все заявки по портфелю) ===
+            if opcode == "OrdersGetAndSubscribeV2":
+                stop = asyncio.Event()
+                active["orders"].append(stop)
+
+                exchange = msg.get("exchange") or "MOCK"
+                portfolio = msg.get("portfolio") or "PORTF"
+                statuses = msg.get("orderStatuses") or []
+                skip_history = bool(msg.get("skipHistory", False))
+                guid = msg.get("guid") or req_guid
+
+                def _order_to_simple(o: Order) -> dict:
+                    ts_sec = o.ts / 1000.0
+                    tt = datetime.datetime.utcfromtimestamp(ts_sec).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    et = (datetime.datetime.utcfromtimestamp(ts_sec) + datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    qty = o.quantity
+                    px = o.price or 0.0
+                    volume = round(px * qty, 5) if px and qty else 0.0
+                    return {
+                        "id": o.id,
+                        "sym": o.symbol,
+                        "tic": f"{exchange}:{o.symbol}",
+                        "p": portfolio,
+                        "ex": exchange,
+                        "cmt": None,
+                        "t": o.type,
+                        "s": o.side,
+                        "st": o.status,
+                        "tt": tt,
+                        "ut": tt,
+                        "et": et,
+                        "q": qty,
+                        "qb": qty,
+                        "fq": o.filledQuantity,
+                        "fqb": o.filledQuantity,
+                        "px": px,
+                        "h": False,
+                        "tf": "oneday",
+                        "i": None,
+                        "v": volume,
+                    }
+
+                async def on_order_v2(o: Order):
+                    if statuses:
+                        # фильтруем по статусу, если он есть в списке
+                        if o.status not in statuses:
+                            return
+                    payload = _order_to_simple(o)
+                    await ws.send_json({"data": payload, "guid": guid})
+
+                # Историю (skipHistory == false) сейчас не эмулируем отдельно,
+                # просто сразу начинаем стрим — для mock этого достаточно.
+                asyncio.create_task(
+                    adapter.subscribe_orders(
+                        symbols,
+                        lambda ord_: asyncio.create_task(on_order_v2(ord_)),
+                        stop,
+                    )
                 )
                 continue
 
@@ -204,13 +300,12 @@ async def stream(ws: WebSocket):
                 code = msg.get("code")
                 group = msg.get("instrumentGroup")
                 # Маппинг code+group → symbol. Для mock можно просто взять code.
-                # Если захочешь строгий маппинг, можно сделать: f"{code}-{group}"
                 symbol = code or (symbols[0] if symbols else "")
 
                 guid = msg.get("guid") or req_guid
 
                 async def on_quote_opcode(q):
-                    # ВАЖНО: формат ответа НЕ меняем — используем тот же, что и в topic=="quotes"
+                    # формат такой же, как в topic=="quotes"
                     await send_wrapped("quotes", q, guid or f"quotes:{getattr(q, 'symbol', '')}")
 
                 if symbol:
