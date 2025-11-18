@@ -7,10 +7,9 @@ import datetime
 
 from api.schemas import Order
 from adapters.mock_adapter import MockAdapter
-# from adapters.okx_adapter import OkxAdapter  # подключим позже
+# from adapters.okx_adapter import OkxAdapter
 
 
-# ---------- фабрика выбора адаптера ----------
 def _make_adapter():
     name = os.getenv("ADAPTER", "mock").lower()
     if name == "okx":
@@ -23,7 +22,6 @@ app = FastAPI(title="Astras Crypto Gateway")
 adapter = _make_adapter()
 
 
-# ---------- helpers: нормализация к Simple-формату Astras ----------
 def _to_simple_full(d: dict) -> dict:
     return {
         "symbol": d.get("symbol") or d.get("sym"),
@@ -37,8 +35,12 @@ def _to_simple_full(d: dict) -> dict:
 
 
 def _to_simple_delta(d: dict) -> dict:
-    # если это не дельта (нет изменения цен) — вернём полный объект
-    if not (("pxmn" in d) or ("pxmx" in d) or ("priceMin" in d) or ("priceMax" in d)):
+    if not (
+        ("pxmn" in d)
+        or ("pxmx" in d)
+        or ("priceMin" in d)
+        or ("priceMax" in d)
+    ):
         return _to_simple_full(d)
     out = {"symbol": d.get("symbol") or d.get("sym")}
     if "pxmn" in d:
@@ -52,82 +54,18 @@ def _to_simple_delta(d: dict) -> dict:
     return out
 
 
-# ---------- REST ----------
-@app.get("/instruments")
-async def instruments():
-    items = await adapter.list_instruments()
-    simple = [_to_simple_full(it) for it in items]
-    return {"data": simple, "guid": "instruments:list"}
-
-
-@app.get("/securities")
-async def securities(symbols: str | None = None):
-    items = await adapter.list_instruments()
-    if symbols:
-        want = {s.strip() for s in symbols.split(",")}
-        items = [it for it in items if (it.get("symbol") or it.get("sym")) in want]
-    simple = [_to_simple_full(it) for it in items]
-    return {"data": simple, "guid": "securities:snapshot"}
-
-
-@app.get("/history")
-async def history(symbol: str, tf: str = "1m", limit: int = 100):
-    bars = await adapter.get_history(symbol, tf, min(limit, 100))
-    return {"data": bars, "guid": f"history:{symbol}:{tf}"}
-
-
-@app.get("/account")
-async def account():
-    return (await adapter.get_account_info()).dict()
-
-
-@app.get("/positions")
-async def positions():
-    return [p.dict() for p in await adapter.get_positions()]
-
-
-# рыночная лента сделок через REST (Slim)
-@app.get("/trades")
-async def trades(symbol: str, exchange: str = "MOCK", limit: int = 100):
-    items = await adapter.get_all_trades(exchange, symbol, min(max(limit, 1), 1000))
-    out = [it.dict() if hasattr(it, "dict") else it for it in items]
-    return {"data": out, "guid": f"alltrades:{exchange}:{symbol}"}
-
-
-@app.post("/orders")
-async def place(o: dict):
-    order = Order(
-        id="",
-        symbol=o["symbol"],
-        side=o["side"],
-        type=o["type"],
-        price=o.get("price"),
-        quantity=o["quantity"],
-        status="new",
-        filledQuantity=0.0,
-        ts=0,
-    )
-    return (await adapter.place_order(order)).dict()
-
-
-@app.delete("/orders/{oid}")
-async def cancel(oid: str, symbol: str):
-    return (await adapter.cancel_order(oid, symbol)).dict()
-
-
-# ---------- WS ----------
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
     await ws.accept()
 
     active: dict[str, list[asyncio.Event]] = {
-        "instruments": [],
+        "instruments": [],   # пока не используются в opcode, оставлены на будущее
         "quotes": [],
         "book": [],
         "fills": [],
         "orders": [],
-        "positions": [],
-        "summaries": [],
+        "positions": [],     # пока не используются в opcode
+        "summaries": [],     # пока не используются в opcode
         "bars": [],
     }
 
@@ -138,15 +76,11 @@ async def stream(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive_json()
-            topic = msg.get("stream")
             opcode = msg.get("opcode")
             token = msg.get("token")
             symbols: List[str] = msg.get("symbols", [])
             req_guid = msg.get("guid")
 
-            # ---------- ALOR-style OPCODE обработка с токеном ----------
-
-            # Для всех opcode требуем непустой token
             if opcode and (not isinstance(token, str) or not token.strip()):
                 await ws.send_json(
                     {
@@ -159,7 +93,6 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
-            # === BarsGetAndSubscribe (история + стрим по свечам) ===
             if opcode == "BarsGetAndSubscribe":
                 stop = asyncio.Event()
                 active["bars"].append(stop)
@@ -191,7 +124,6 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
-            # === OrdersGetAndSubscribeV2 (все заявки по портфелю) ===
             if opcode == "OrdersGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["orders"].append(stop)
@@ -205,7 +137,10 @@ async def stream(ws: WebSocket):
                 def _order_to_simple(o: Order) -> dict:
                     ts_sec = o.ts / 1000.0
                     tt = datetime.datetime.utcfromtimestamp(ts_sec).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                    et = (datetime.datetime.utcfromtimestamp(ts_sec) + datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                    et = (
+                        datetime.datetime.utcfromtimestamp(ts_sec)
+                        + datetime.timedelta(days=1)
+                    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                     qty = o.quantity
                     px = o.price or 0.0
                     volume = round(px * qty, 5) if px and qty else 0.0
@@ -235,14 +170,11 @@ async def stream(ws: WebSocket):
 
                 async def on_order_v2(o: Order):
                     if statuses:
-                        # фильтруем по статусу, если он есть в списке
                         if o.status not in statuses:
                             return
                     payload = _order_to_simple(o)
                     await ws.send_json({"data": payload, "guid": guid})
 
-                # Историю (skipHistory == false) сейчас не эмулируем отдельно,
-                # просто сразу начинаем стрим — для mock этого достаточно.
                 asyncio.create_task(
                     adapter.subscribe_orders(
                         symbols,
@@ -252,20 +184,17 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
-            # === OrderBookGetAndSubscribe (биржевой стакан) ===
             if opcode == "OrderBookGetAndSubscribe":
                 stop = asyncio.Event()
                 active["book"].append(stop)
 
-                code = msg.get("code")     # например "SBER" или "BTC-USDT"
-                group = msg.get("instrumentGroup")  # например "TQBR" или "SPOT"
-                # В mock мы игнорируем exchange/board и используем только symbol
+                code = msg.get("code")
+                group = msg.get("instrumentGroup")
                 symbol = code or (symbols[0] if symbols else "")
 
                 guid = msg.get("guid") or req_guid
 
                 async def on_book(b):
-                    # b — это BookSlim (symbol, bids[(price, qty)], asks[(price, qty)], ts в мс)
                     payload = {
                         "b": [
                             {"p": price, "v": volume}
@@ -275,8 +204,8 @@ async def stream(ws: WebSocket):
                             {"p": price, "v": volume}
                             for price, volume in b.asks
                         ],
-                        "t": b.ts,   # ms_timestamp
-                        "h": False,  # heavy = false (общий Slim)
+                        "t": b.ts,
+                        "h": False,
                     }
                     await ws.send_json(
                         {"data": payload, "guid": guid or f"book:{b.symbol}"}
@@ -292,21 +221,22 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
-            # === QuotesSubscribe (котировки по opcode) ===
             if opcode == "QuotesSubscribe":
                 stop = asyncio.Event()
                 active["quotes"].append(stop)
 
                 code = msg.get("code")
                 group = msg.get("instrumentGroup")
-                # Маппинг code+group → symbol. Для mock можно просто взять code.
                 symbol = code or (symbols[0] if symbols else "")
 
                 guid = msg.get("guid") or req_guid
 
                 async def on_quote_opcode(q):
-                    # формат такой же, как в topic=="quotes"
-                    await send_wrapped("quotes", q, guid or f"quotes:{getattr(q, 'symbol', '')}")
+                    await send_wrapped(
+                        "quotes",
+                        q,
+                        guid or f"quotes:{getattr(q, 'symbol', '')}",
+                    )
 
                 if symbol:
                     asyncio.create_task(
@@ -318,17 +248,15 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
-            # === TradesGetAndSubscribeV2 (fills: сделки по портфелю) ===
             if opcode == "TradesGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["fills"].append(stop)
 
                 portfolio = msg.get("portfolio")
                 guid = msg.get("guid") or req_guid
-                _skip_history = msg.get("skipHistory", False)  # сейчас просто игнорируем
+                _skip_history = msg.get("skipHistory", False)
 
                 async def on_fill_opcode(fill):
-                    # Формат ответа НЕ меняем — отдаём ровно то, что шлёт адаптер
                     await ws.send_json({
                         "data": fill,
                         "guid": guid
@@ -343,162 +271,11 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
-            # ---------- subscribe handlers по нашему "stream" протоколу ----------
-            if topic == "instruments":
-                stop = asyncio.Event()
-                active["instruments"].append(stop)
-
-                async def send_inst(raw: dict):
-                    if "exchange" in raw or "ex" in raw:
-                        await ws.send_json(
-                            {"data": _to_simple_full(raw), "guid": req_guid or "instruments:req"}
-                        )
-                    else:
-                        await ws.send_json(
-                            {"data": _to_simple_delta(raw), "guid": req_guid or "instruments:req"}
-                        )
-
-                asyncio.create_task(adapter.stream_instruments(symbols, send_inst, stop))
-
-            elif topic == "quotes":
-                stop = asyncio.Event()
-                active["quotes"].append(stop)
-
-                async def on_quote(q):
-                    await send_wrapped(
-                        "quotes",
-                        q,
-                        req_guid
-                        or f"quotes:{getattr(q, 'symbol', getattr(q, 'sym', ''))}",
-                    )
-
-                asyncio.create_task(
-                    adapter.subscribe_quotes(
-                        symbols,
-                        lambda q: asyncio.create_task(on_quote(q)),
-                        stop,
-                    )
-                )
-
-            elif topic == "book":
-                stop = asyncio.Event()
-                active["book"].append(stop)
-
-                async def on_book_stream(b):
-                    # b — это BookSlim (symbol, bids[(price, qty)], asks[(price, qty)], ts в мс)
-                    payload = {
-                        "b": [
-                            {"p": price, "v": volume}
-                            for price, volume in b.bids
-                        ],
-                        "a": [
-                            {"p": price, "v": volume}
-                            for price, volume in b.asks
-                        ],
-                        "t": b.ts,
-                        "h": False,
-                    }
-                    await ws.send_json(
-                        {"data": payload, "guid": req_guid or f"book:{b.symbol}"}
-                    )
-
-                asyncio.create_task(
-                    adapter.subscribe_order_book(
-                        symbols,
-                        lambda b: asyncio.create_task(on_book_stream(b)),
-                        stop,
-                    )
-                )
-
-            elif topic == "fills":
-                stop = asyncio.Event()
-                active["fills"].append(stop)
-
-                async def on_fill(d: dict):
-                    await ws.send_json({"data": d, "guid": req_guid or "fills:req"})
-
-                asyncio.create_task(
-                    adapter.subscribe_fills(
-                        symbols,
-                        lambda x: asyncio.create_task(on_fill(x)),
-                        stop,
-                    )
-                )
-
-            elif topic == "orders":
-                stop = asyncio.Event()
-                active["orders"].append(stop)
-
-                async def on_order(o):
-                    await send_wrapped("orders", o, req_guid or f"orders:{o.symbol}")
-
-                asyncio.create_task(
-                    adapter.subscribe_orders(
-                        symbols,
-                        lambda o: asyncio.create_task(on_order(o)),
-                        stop,
-                    )
-                )
-
-            elif topic == "positions":
-                stop = asyncio.Event()
-                active["positions"].append(stop)
-
-                async def on_pos(p):
-                    await send_wrapped("positions", p, req_guid or f"positions:{p.symbol}")
-
-                asyncio.create_task(
-                    adapter.subscribe_positions(
-                        symbols,
-                        lambda p: asyncio.create_task(on_pos(p)),
-                        stop,
-                    )
-                )
-
-            elif topic == "summaries":
-                stop = asyncio.Event()
-                active["summaries"].append(stop)
-
-                async def on_sum(d: dict):
-                    await ws.send_json({"data": d, "guid": req_guid or "summaries:req"})
-
-                asyncio.create_task(
-                    adapter.subscribe_summaries(
-                        lambda d: asyncio.create_task(on_sum(d)),
-                        stop,
-                    )
-                )
-
-            elif topic == "bars":
-                # разовая выборка — без регистрации в active
-                tf = msg.get("tf", "1m")
-                limit = int(msg.get("limit", 50))
-                sym = symbols[0] if symbols else "UNKNOWN"
-                bars = await adapter.get_history(sym, tf, min(limit, 100))
-                for b in bars:
-                    await ws.send_json(
-                        {"data": b, "guid": req_guid or f"bars:{sym}"}
-                    )
-
-            elif topic == "unsubscribe":
-                # можно прислать topic (конкретный) или опустить (отписка от всех)
-                which = msg.get("topic")  # any from active keys | None
-                targets = [which] if which in active else list(active.keys())
-                for t in targets:
-                    for ev in active[t]:
-                        ev.set()
-                    active[t].clear()
-                await ws.send_json(
-                    {
-                        "data": {"ok": True, "unsubscribed": targets},
-                        "guid": req_guid or "unsub:ok",
-                    }
-                )
-
-            # неизвестный stream/opcode — игнорируем
+            # другие opcode можно добавить здесь:
+            
+            # неизвестный opcode просто игнорируем
 
     except WebSocketDisconnect:
-        # отписываемся от всего при разрыве
         for lst in active.values():
             for ev in lst:
                 ev.set()

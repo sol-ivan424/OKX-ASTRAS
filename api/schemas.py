@@ -15,25 +15,6 @@ class Instrument(BaseModel):
     lotSize: float
     tickSize: float
 
-class Quote(BaseModel):
-    symbol: str
-    bid: Optional[float]
-    ask: Optional[float]
-    ts: int
-
-class OrderBook(BaseModel):
-    symbol: str
-    bids: List[Tuple[float, float]]
-    asks: List[Tuple[float, float]]
-    ts: int
-
-class Trade(BaseModel):
-    symbol: str
-    price: float
-    size: float
-    side: Side
-    ts: int
-
 class Order(BaseModel):
     id: str
     symbol: str
