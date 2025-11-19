@@ -93,6 +93,7 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
+            # свечи (история)
             if opcode == "BarsGetAndSubscribe":
                 stop = asyncio.Event()
                 active["bars"].append(stop)
@@ -124,6 +125,7 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
+            # все заявки по портфелю
             if opcode == "OrdersGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["orders"].append(stop)
@@ -184,6 +186,7 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
+            # стакан
             if opcode == "OrderBookGetAndSubscribe":
                 stop = asyncio.Event()
                 active["book"].append(stop)
@@ -221,6 +224,7 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
+            # котировки инструмента
             if opcode == "QuotesSubscribe":
                 stop = asyncio.Event()
                 active["quotes"].append(stop)
@@ -248,6 +252,7 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
+            # все сделки по портфелю
             if opcode == "TradesGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["fills"].append(stop)
@@ -266,6 +271,62 @@ async def stream(ws: WebSocket):
                     adapter.subscribe_fills(
                         [portfolio] if portfolio else [],
                         lambda f: asyncio.create_task(on_fill_opcode(f)),
+                        stop,
+                    )
+                )
+                continue
+            
+                        # === PositionsGetAndSubscribeV2 (позиции по портфелю, Slim-формат) ===
+
+            # все позиции портфеля
+            if opcode == "PositionsGetAndSubscribeV2":
+                stop = asyncio.Event()
+                active["positions"].append(stop)
+
+                # параметры запроса Astras
+                exchange = msg.get("exchange") or "MOEX"
+                portfolio = msg.get("portfolio") or "D39004"
+                guid = msg.get("guid") or req_guid
+                _skip_history = msg.get("skipHistory", False)  # в mock игнорируем
+                # format в mock тоже игнорируем и всегда отдаём Slim
+
+                async def on_pos_opcode(pos):
+                    # pos — это наш api.schemas.Position (symbol, qty, avgPrice, pnl, ts)
+                    qty = pos.qty or 0.0
+                    px = pos.avgPrice or 0.0
+                    volume = round(qty * px, 6)
+
+                    payload = {
+                        "v": volume,                       # стоимость позиции
+                        "cv": volume,                      # текущая стоимость (в mock = v)
+                        "sym": pos.symbol,                 # тикер, например "APTK"
+                        "tic": f"{exchange}:{pos.symbol}", # "MOEX:APTK"
+                        "p": portfolio,                    # портфель
+                        "ex": exchange,                    # биржа
+
+                        "pxavg": px,                       # средняя цена
+                        "q": qty,                          # текущий остаток
+                        "o": qty,                          # исходный объём (в mock = q)
+                        "lot": 1,                          # размер лота (захардкожен)
+                        "n": pos.symbol,                   # имя инструмента (в mock = тикер)
+
+                        "q0": qty,                         # нач. остаток
+                        "q1": qty,                         # на начало дня
+                        "q2": qty,                         # на конец дня
+                        "qf": qty,                         # фактический остаток
+
+                        "upd": 0.0,                        # изменение стоимости (mock)
+                        "up": pos.pnl or 0.0,              # PnL
+                        "cur": False,                      # валютная? (mock)
+                        "h": True,                         # позиция активна
+                    }
+
+                    await ws.send_json({"data": payload, "guid": guid})
+
+                asyncio.create_task(
+                    adapter.subscribe_positions(
+                        symbols,  # если пусто — mock использует все инструменты
+                        lambda p: asyncio.create_task(on_pos_opcode(p)),
                         stop,
                     )
                 )
