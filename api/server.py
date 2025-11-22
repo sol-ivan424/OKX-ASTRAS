@@ -1,6 +1,6 @@
 import os
 import time
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from typing import List
 import asyncio
 import datetime
@@ -53,6 +53,56 @@ def _to_simple_delta(d: dict) -> dict:
         out["priceMax"] = d["priceMax"]
     return out
 
+# все торговые инструменты
+@app.get("/v2/instruments")
+async def get_instruments(exchange: str = "MOEX", format: str = "Slim", token: str = None):
+
+    if not token:
+        raise HTTPException(400, detail="TokenRequired")
+
+    raw = await adapter.list_instruments()   # MOCK: Simple-вид
+
+    out = []
+    for inst in raw:
+        # переводим Simple → Slim
+        slim = {
+            "sym": inst.get("symbol"),
+            "n": inst.get("symbol"),                   # короткое имя (в mock нет — ставим symbol)
+            "desc": inst.get("symbol"),                # описание (в mock нет — ставим symbol)
+            "ex": inst.get("exchange"),
+            "t": f"Mock instrument {inst.get('symbol')}",
+
+            "lot": 1,
+            "fv": 1,
+            "cfi": None,
+            "stp": inst.get("priceMin"),
+            "cncl": None,
+            "rt": 0,
+            "mgb": inst.get("priceMin"),
+            "mgs": inst.get("priceMax"),
+            "mgrt": 0,
+            "stppx": 1,
+            "pxmx": inst.get("priceMax"),
+            "pxmn": inst.get("priceMin"),
+            "pxt": 0,
+            "pxtl": 0,
+            "pxmu": 1,
+            "pxu": 1,
+            "vl": 0,
+            "cur": "RUB",
+            "isin": None,
+            "yld": None,
+            "bd": inst.get("board"),
+            "pbd": inst.get("board"),
+            "st": inst.get("tradingStatus", 17),
+            "sti": inst.get("tradingStatusInfo", "нормальный период торгов"),
+            "cpct": "2",
+        }
+
+        out.append(slim)
+
+    return out
+
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
@@ -64,8 +114,8 @@ async def stream(ws: WebSocket):
         "book": [],
         "fills": [],
         "orders": [],
-        "positions": [],     # пока не используются в opcode
-        "summaries": [],     # пока не используются в opcode
+        "positions": [],
+        "summaries": [],
         "bars": [],
     }
 
@@ -332,9 +382,9 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
-            # другие opcode можно добавить здесь:
+            # другие opcode...
             
-            # неизвестный opcode просто игнорируем
+            # неизвестный opcode игнорируем
 
     except WebSocketDisconnect:
         for lst in active.values():
