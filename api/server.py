@@ -7,14 +7,14 @@ import datetime
 
 from api.schemas import Order
 from adapters.mock_adapter import MockAdapter
-# from adapters.okx_adapter import OkxAdapter
+from adapters.okx_adapter import OkxAdapter
 
 
 def _make_adapter():
     name = os.getenv("ADAPTER", "mock").lower()
     if name == "okx":
-        # return OkxAdapter(...)
-        raise RuntimeError("OkxAdapter is not wired yet")
+        return OkxAdapter()
+        #raise RuntimeError("OkxAdapter is not wired yet")
     return MockAdapter()
 
 
@@ -60,48 +60,8 @@ async def get_instruments(exchange: str = "MOEX", format: str = "Slim", token: s
     if not token:
         raise HTTPException(400, detail="TokenRequired")
 
-    raw = await adapter.list_instruments()   # MOCK: Simple-вид
-
-    out = []
-    for inst in raw:
-        # переводим Simple → Slim
-        slim = {
-            "sym": inst.get("symbol"),
-            "n": inst.get("symbol"),                   # короткое имя (в mock нет — ставим symbol)
-            "desc": inst.get("symbol"),                # описание (в mock нет — ставим symbol)
-            "ex": inst.get("exchange"),
-            "t": f"Mock instrument {inst.get('symbol')}",
-
-            "lot": 1,
-            "fv": 1,
-            "cfi": None,
-            "stp": inst.get("priceMin"),
-            "cncl": None,
-            "rt": 0,
-            "mgb": inst.get("priceMin"),
-            "mgs": inst.get("priceMax"),
-            "mgrt": 0,
-            "stppx": 1,
-            "pxmx": inst.get("priceMax"),
-            "pxmn": inst.get("priceMin"),
-            "pxt": 0,
-            "pxtl": 0,
-            "pxmu": 1,
-            "pxu": 1,
-            "vl": 0,
-            "cur": "RUB",
-            "isin": None,
-            "yld": None,
-            "bd": inst.get("board"),
-            "pbd": inst.get("board"),
-            "st": inst.get("tradingStatus", 17),
-            "sti": inst.get("tradingStatusInfo", "нормальный период торгов"),
-            "cpct": "2",
-        }
-
-        out.append(slim)
-
-    return out
+    raw = await adapter.list_instruments()
+    return raw
 
 
 @app.websocket("/stream")
