@@ -1,18 +1,11 @@
-import asyncio
-import json
-import time
-from typing import Any, Dict, Optional, Callable, Awaitable, List
+# adapters/okx_adapter.py
+
+from typing import Any, Dict, Optional, List
 
 import httpx
-import websockets
 
 
-def _now_ms() -> int:
-    """Текущее время в миллисекундах."""
-    return int(time.time() * 1000)
-
-
-# Преобразуем строковое состояние инструмента OKX в числовой tradingStatus Astras
+# Маппинг строкового состояния инструмента OKX в числовой tradingStatus Astras
 OKX_STATE_TO_TRADING_STATUS: Dict[str, int] = {
     "live": 1,
     "preopen": 2,
@@ -26,29 +19,27 @@ class OkxAdapter:
     """
     Адаптер для биржи OKX.
 
-    В этой версии:
-    - REST-клиент
-    - инструменты сразу в Slim-формате Astras
-    - базовая WS-инфраструктура (для будущих подписок на котировки/стакан и т. д.)
+    На данный момент реализовано только получение инструментов
+    и возврат их сразу в Slim-формате Astras.
     """
 
     def __init__(
         self,
         rest_base: str = "https://www.okx.com",
-        ws_public: str = "wss://ws.okx.com/ws/v5/public",
-        ws_business: str = "wss://ws.okx.com/ws/v5/business",
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         api_passphrase: Optional[str] = None,
         demo: bool = False,
     ) -> None:
-
-        # Базовые URL REST и WebSocket
+        """
+        rest_base        — базовый URL для REST API OKX
+        api_key          — API-ключ (пока не используется, но сохранён для будущих приватных методов)
+        api_secret       — секретный ключ (пока не используется)
+        api_passphrase   — passphrase (пока не используется)
+        demo             — флаг для будущей поддержки demo-окружения
+        """
         self._rest_base = rest_base.rstrip("/")
-        self._ws_public_url = ws_public
-        self._ws_business_url = ws_business
 
-        # Ключи пока не используются, но оставлены для будущего функционала
         self._api_key = api_key
         self._api_secret = api_secret
         self._api_passphrase = api_passphrase
@@ -58,7 +49,7 @@ class OkxAdapter:
         self._http_client: Optional[httpx.AsyncClient] = None
 
     async def _get_http_client(self) -> httpx.AsyncClient:
-        """Ленивая инициализация httpx.AsyncClient."""
+        """Создаёт и возвращает httpx.AsyncClient при первом обращении."""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(
                 base_url=self._rest_base,
@@ -67,7 +58,7 @@ class OkxAdapter:
         return self._http_client
 
     async def close(self) -> None:
-        """Закрытие HTTP-клиента при завершении работы адаптера."""
+        """Закрывает HTTP-клиент при остановке адаптера."""
         if self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
@@ -79,14 +70,14 @@ class OkxAdapter:
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Выполнение публичного REST-запроса к OKX.
+        Выполняет публичный REST-запрос к OKX.
 
-        path может быть вида "market/ticker" или "/market/ticker".
+        path может быть вида "public/instruments" или "/public/instruments".
         Здесь автоматически добавляется префикс /api/v5.
         """
         client = await self._get_http_client()
 
-        # Формируем корректный путь
+        # Нормализуем путь: добавляем ведущий слэш и префикс /api/v5 при необходимости
         if not path.startswith("/"):
             path = "/" + path
         if not path.startswith("/api/"):
@@ -97,10 +88,9 @@ class OkxAdapter:
 
         data = resp.json()
 
+        # Стандартный формат ответа OKX: {"code": "0", "msg": "", "data": [...]}
         if data.get("code") not in ("0", 0, None):
-            raise RuntimeError(
-                f"OKX error {data.get('code')}: {data.get('msg')}"
-            )
+            raise RuntimeError(f"OKX error {data.get('code')}: {data.get('msg')}")
 
         return data
 
@@ -110,6 +100,9 @@ class OkxAdapter:
 
         Используется публичный метод:
         GET /api/v5/public/instruments?instType=SPOT
+
+        Все поля, которые нельзя корректно заполнить на основе ответа OKX,
+        оставляются равными None.
         """
 
         params = {"instType": "SPOT"}
@@ -123,32 +116,29 @@ class OkxAdapter:
         out: List[dict] = []
 
         for item in raw.get("data", []):
-
-            inst_id = item.get("instId")
-            inst_type = item.get("instType")
+            inst_id = item.get("instId")       # например "BTC-USDT"
+            inst_type = item.get("instType")   # "SPOT", "SWAP", "FUTURES", ...
             state = item.get("state", "unknown")
 
-            base = item.get("baseCcy")
-            quote = item.get("quoteCcy")
+            quote = item.get("quoteCcy")       # валюта котировки, например "USDT"
+            lot_sz = item.get("lotSz")         # минимальный лот
+            tick_sz = item.get("tickSz")       # шаг цены
 
-            lot_sz = item.get("lotSz")      # минимальный лот
-            tick_sz = item.get("tickSz")    # шаг цены
-
-            def to_float(v):
-                """Пробуем преобразовать значение в float."""
+            def to_float(value: Any) -> Optional[float]:
+                """Аккуратно конвертирует значение в float, если это возможно."""
                 try:
-                    return float(v)
-                except:
+                    return float(value)
+                except (TypeError, ValueError):
                     return None
 
             slim = {
                 # Основные поля Slim
                 "sym": inst_id,
                 "n": inst_id,
-                "desc": inst_id,     # OKX не отдаёт текстовое описание — оставляем символ
+                "desc": inst_id,
                 "ex": "OKX",
 
-                # Описание (в Astras "t") — биржа не предоставляет
+                # Текстовое описание инструмента биржа не отдаёт
                 "t": None,
 
                 # Лоты и параметры инструмента
@@ -161,7 +151,7 @@ class OkxAdapter:
                 "cncl": None,
                 "rt": None,
 
-                # Границы цен — OKX их не отдаёт для SPOT
+                # Границы цен — публичное API OKX их не отдаёт для SPOT
                 "mgb": None,
                 "mgs": None,
                 "mgrt": None,
@@ -170,89 +160,32 @@ class OkxAdapter:
                 "pxmx": None,
                 "pxmn": None,
 
-                # Разные вспомогательные поля
+                # Вспомогательные поля, для криптобиржи значения отсутствуют
                 "pxt": None,
                 "pxtl": None,
                 "pxmu": None,
                 "pxu": None,
                 "vl": None,
 
-                # Валюта — корректно ставить валюту котировки
+                # Валюта котировки инструмента
                 "cur": quote,
 
+                # Для криптовалют ISIN и доходность не применимы
                 "isin": None,
                 "yld": None,
 
-                # Тип инструмента (SPOT/SWAP/FUTURES...)
+                # Тип инструмента (SPOT/SWAP/FUTURES/OPTION...)
                 "bd": inst_type,
                 "pbd": inst_type,
 
                 # Торговый статус
                 "st": OKX_STATE_TO_TRADING_STATUS.get(state, 0),
                 "sti": state,
+
+                # Тип точности цены — у OKX прямого аналога нет
                 "cpct": None,
             }
 
             out.append(slim)
 
         return out
-
-    async def _ws_subscribe(
-        self,
-        url: str,
-        args: List[Dict[str, Any]],
-        on_message: Callable[[Dict[str, Any]], Awaitable[None]],
-        stop_event: asyncio.Event,
-        ping_interval: float = 20.0,
-    ) -> None:
-        """
-        Универсальная подписка на WebSocket-каналы OKX.
-        """
-        payload = {"op": "subscribe", "args": args}
-
-        try:
-            async with websockets.connect(url, ping_interval=ping_interval) as ws:
-                await ws.send(json.dumps(payload))
-
-                while not stop_event.is_set():
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=ping_interval)
-                    except asyncio.TimeoutError:
-                        continue
-
-                    try:
-                        msg = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if msg.get("event") in ("subscribe", "error"):
-                        continue
-
-                    await on_message(msg)
-
-        except Exception as exc:
-            self._log_error("Ошибка WebSocket-подключения", url=url, error=str(exc))
-
-    async def _ws_subscribe_public(
-        self,
-        args: List[Dict[str, Any]],
-        on_message: Callable[[Dict[str, Any]], Awaitable[None]],
-        stop_event: asyncio.Event,
-    ) -> None:
-        """Обёртка для подписки на публичные WebSocket-каналы OKX."""
-        await self._ws_subscribe(self._ws_public_url, args, on_message, stop_event)
-
-    async def _ws_subscribe_business(
-        self,
-        args: List[Dict[str, Any]],
-        on_message: Callable[[Dict[str, Any]], Awaitable[None]],
-        stop_event: asyncio.Event,
-    ) -> None:
-        """Обёртка для подписки на бизнес-каналы OKX."""
-        await self._ws_subscribe(self._ws_business_url, args, on_message, stop_event)
-
-    def _log_debug(self, msg: str, **extra: Any) -> None:
-        print(f"[OKX DEBUG] {msg} | {extra}")
-
-    def _log_error(self, msg: str, **extra: Any) -> None:
-        print(f"[OKX ERROR] {msg} | {extra}")

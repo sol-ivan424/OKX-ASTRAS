@@ -9,12 +9,21 @@ from api.schemas import Order
 from adapters.mock_adapter import MockAdapter
 from adapters.okx_adapter import OkxAdapter
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 def _make_adapter():
     name = os.getenv("ADAPTER", "mock").lower()
+    
     if name == "okx":
-        return OkxAdapter()
-        #raise RuntimeError("OkxAdapter is not wired yet")
+        from adapters.okx_adapter import OkxAdapter
+        return OkxAdapter(
+            api_key=os.getenv("OKX_API_KEY"),
+            api_secret=os.getenv("OKX_API_SECRET"),
+            api_passphrase=os.getenv("OKX_API_PASSPHRASE"),
+        )
+
     return MockAdapter()
 
 
