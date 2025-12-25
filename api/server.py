@@ -78,7 +78,7 @@ async def stream(ws: WebSocket):
     await ws.accept()
 
     active: dict[str, list[asyncio.Event]] = {
-        "instruments": [],   # пока не используются в opcode, оставлены на будущее
+        "instruments": [],   # пока не используются в opcode
         "quotes": [],
         "book": [],
         "fills": [],
