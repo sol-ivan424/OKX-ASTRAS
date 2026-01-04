@@ -45,7 +45,61 @@ class MockAdapter:
 
     # ---------- INSTRUMENTS ----------
     async def list_instruments(self) -> List[dict]:
-        return list(self._inst_state.values())
+        # Возвращаем инструменты сразу в формате Astras SIMPLE (полный объект).
+        # server.py при GET /v2/instruments просто отдаёт то, что вернул адаптер,
+        # поэтому формат задаём здесь.
+
+        out: List[dict] = []
+
+        for sym, cur in self._inst_state.items():
+            symbol = cur.get("symbol") or sym
+            exchange = cur.get("exchange") or "MOCK"
+            board = cur.get("board") or "SPOT"
+
+            out.append({
+                "symbol": symbol,
+                "shortname": cur.get("shortname") or symbol,
+                "description": cur.get("description") or symbol,
+
+                "exchange": exchange,
+                "market": cur.get("market") or board,
+                "type": cur.get("type") or "Инструмент (mock)",
+
+                "lotsize": cur.get("lotsize", 1),
+                "facevalue": cur.get("facevalue", 1),
+                "cfiCode": cur.get("cfiCode"),
+                "cancellation": cur.get("cancellation"),
+
+                "minstep": cur.get("minstep", 0.0),
+                "rating": cur.get("rating", 0),
+
+                "marginbuy": cur.get("marginbuy", 0.0),
+                "marginsell": cur.get("marginsell", 0.0),
+                "marginrate": cur.get("marginrate", 0.0),
+
+                "pricestep": cur.get("pricestep", 0.0),
+                "priceMax": cur.get("priceMax"),
+                "priceMin": cur.get("priceMin"),
+                "theorPrice": cur.get("theorPrice", 0.0),
+                "theorPriceLimit": cur.get("theorPriceLimit", 0.0),
+                "volatility": cur.get("volatility", 0.0),
+
+                "currency": cur.get("currency") or "RUB",
+                "ISIN": cur.get("ISIN"),
+                "yield": cur.get("yield"),
+
+                "board": cur.get("board") or board,
+                "primary_board": cur.get("primary_board") or (cur.get("board") or board),
+
+                "tradingStatus": cur.get("tradingStatus", 17),
+                "tradingStatusInfo": cur.get("tradingStatusInfo", "нормальный период торгов"),
+
+                "complexProductCategory": cur.get("complexProductCategory"),
+                "priceMultiplier": cur.get("priceMultiplier", 1),
+                "priceShownUnits": cur.get("priceShownUnits", 1),
+            })
+
+        return out
 
     async def stream_instruments(
         self,

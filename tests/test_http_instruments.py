@@ -13,13 +13,12 @@ from api.server import app
 client = TestClient(app)
 
 
-
-"""def test_http_get_instruments_slim_format():
+def test_http_get_instruments_simple_format():
     response = client.get(
         "/v2/instruments",
         params={
             "exchange": "MOEX",
-            "format": "Slim",
+            "format": "Simple",
             "token": "test-token-123",
         }
     )
@@ -28,21 +27,57 @@ client = TestClient(app)
 
     data = response.json()
     assert isinstance(data, list), "response must be a list"
-
     assert len(data) > 0, "instruments list should not be empty"
 
     instrument = data[0]
+    assert isinstance(instrument, dict), "instrument must be an object"
 
-    # Поля SLIM-формата Astras для инструментов
+    # Поля SIMPLE-формата Astras для инструментов (по примеру из документации)
     required_keys = (
-        "sym", "n", "desc", "ex", "t",
-        "lot", "fv", "cfi", "stp", "cncl",
-        "rt", "mgb", "mgs", "mgrt", "stppx",
-        "pxmx", "pxmn", "pxt", "pxtl", "pxmu",
-        "pxu", "vl", "cur", "isin", "yld",
-        "bd", "pbd", "st", "sti", "cpct"
+        "symbol",
+        "shortname",
+        "description",
+        "exchange",
+        "market",
+        "type",
+        "lotsize",
+        "facevalue",
+        "cfiCode",
+        "cancellation",
+        "minstep",
+        "rating",
+        "marginbuy",
+        "marginsell",
+        "marginrate",
+        "pricestep",
+        "priceMax",
+        "priceMin",
+        "theorPrice",
+        "theorPriceLimit",
+        "volatility",
+        "currency",
+        "ISIN",
+        "yield",
+        "board",
+        "primary_board",
+        "tradingStatus",
+        "tradingStatusInfo",
+        "complexProductCategory",
+        "priceMultiplier",
+        "priceShownUnits",
     )
 
     for key in required_keys:
         assert key in instrument, f"missing field '{key}' in instrument: {instrument}"
-"""
+
+
+def test_http_get_instruments_requires_token():
+    response = client.get(
+        "/v2/instruments",
+        params={
+            "exchange": "MOEX",
+            "format": "Simple",
+        }
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "TokenRequired"}

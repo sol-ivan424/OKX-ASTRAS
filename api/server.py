@@ -15,9 +15,8 @@ load_dotenv()
 
 def _make_adapter():
     name = os.getenv("ADAPTER", "mock").lower()
-    
+
     if name == "okx":
-        from adapters.okx_adapter import OkxAdapter
         return OkxAdapter(
             api_key=os.getenv("OKX_API_KEY"),
             api_secret=os.getenv("OKX_API_SECRET"),
@@ -31,36 +30,75 @@ app = FastAPI(title="Astras Crypto Gateway")
 adapter = _make_adapter()
 
 
-def _to_simple_full(d: dict) -> dict:
+def _astras_instrument_simple(d: dict) -> dict:
+    """
+    Преобразует нейтральный формат инструмента от адаптера в Astras SIMPLE.
+
+    если поля нет — в ответе будет 0.
+    Ожидаемые поля от адаптера для OKX:
+    symbol, exchange, instType, state, baseCcy, quoteCcy, lotSz, tickSz
+    """
+
+    symbol = d["symbol"]
+    exchange = d["exchange"]
+
+    inst_type = d.get("instType")
+    state = d.get("state")
+
+    lot_sz = d.get("lotSz")
+    tick_sz = d.get("tickSz")
+
+    quote_ccy = d.get("quoteCcy")
+
+    price_multiplier = d.get("priceMultiplier")
+    if price_multiplier is None:
+        price_multiplier = 0
+
+    price_shown_units = d.get("priceShownUnits")
+    if price_shown_units is None:
+        price_shown_units = 0
+
     return {
-        "symbol": d.get("symbol") or d.get("sym"),
-        "exchange": d.get("exchange") or d.get("ex"),
-        "board": d.get("board") or d.get("bd") or "SPOT",
-        "tradingStatus": d.get("tradingStatus") if "tradingStatus" in d else d.get("st", 17),
-        "tradingStatusInfo": d.get("tradingStatusInfo") if "tradingStatusInfo" in d else d.get("sti", "normal trading"),
-        "priceMin": d.get("priceMin") if "priceMin" in d else d.get("pxmn"),
-        "priceMax": d.get("priceMax") if "priceMax" in d else d.get("pxmx"),
+        "symbol": symbol,
+        "shortname": symbol,
+        "description": d.get("description", 0),
+        "exchange": exchange,
+        "market": inst_type if inst_type is not None else 0,
+        "type": d.get("type", 0),
+
+        "lotsize": lot_sz if lot_sz is not None else 0,
+        "facevalue": d.get("facevalue", 0),
+        "cfiCode": d.get("cfiCode", 0),
+        "cancellation": d.get("cancellation", 0),
+
+        "minstep": tick_sz if tick_sz is not None else 0,
+        "rating": d.get("rating", 0),
+        "marginbuy": d.get("marginbuy", 0),
+        "marginsell": d.get("marginsell", 0),
+        "marginrate": d.get("marginrate", 0),
+
+        "pricestep": tick_sz,
+        "priceMax": d.get("priceMax", 0),
+        "priceMin": d.get("priceMin", 0),
+        "theorPrice": d.get("theorPrice", 0),
+        "theorPriceLimit": d.get("theorPriceLimit", 0),
+        "volatility": d.get("volatility", 0),
+
+        "currency": quote_ccy if quote_ccy is not None else 0,
+        "ISIN": d.get("ISIN", 0),
+        "yield": d.get("yield", 0),
+
+        "board": inst_type if inst_type is not None else 0,
+        "primary_board": inst_type if inst_type is not None else 0,
+
+        "tradingStatus": d.get("tradingStatus", 0),
+        "tradingStatusInfo": state if state is not None else 0,
+
+        "complexProductCategory": d.get("complexProductCategory", 0),
+        "priceMultiplier": price_multiplier,
+        "priceShownUnits": price_shown_units,
     }
 
-
-def _to_simple_delta(d: dict) -> dict:
-    if not (
-        ("pxmn" in d)
-        or ("pxmx" in d)
-        or ("priceMin" in d)
-        or ("priceMax" in d)
-    ):
-        return _to_simple_full(d)
-    out = {"symbol": d.get("symbol") or d.get("sym")}
-    if "pxmn" in d:
-        out["priceMin"] = d["pxmn"]
-    if "pxmx" in d:
-        out["priceMax"] = d["pxmx"]
-    if "priceMin" in d:
-        out["priceMin"] = d["priceMin"]
-    if "priceMax" in d:
-        out["priceMax"] = d["priceMax"]
-    return out
 
 # все торговые инструменты
 @app.get("/v2/instruments")
@@ -70,7 +108,7 @@ async def get_instruments(exchange: str = "MOEX", format: str = "Slim", token: s
         raise HTTPException(400, detail="TokenRequired")
 
     raw = await adapter.list_instruments()
-    return raw
+    return [_astras_instrument_simple(x) for x in raw]
 
 
 @app.websocket("/stream")
@@ -294,66 +332,57 @@ async def stream(ws: WebSocket):
                     )
                 )
                 continue
-            
-                        # === PositionsGetAndSubscribeV2 (позиции по портфелю, Slim-формат) ===
 
             # все позиции портфеля
             if opcode == "PositionsGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["positions"].append(stop)
 
-                # параметры запроса Astras
                 exchange = msg.get("exchange") or "MOEX"
                 portfolio = msg.get("portfolio") or "D39004"
                 guid = msg.get("guid") or req_guid
-                _skip_history = msg.get("skipHistory", False)  # в mock игнорируем
-                # format в mock тоже игнорируем и всегда отдаём Slim
+                _skip_history = msg.get("skipHistory", False)
 
                 async def on_pos_opcode(pos):
-                    # pos — это наш api.schemas.Position (symbol, qty, avgPrice, pnl, ts)
                     qty = pos.qty or 0.0
                     px = pos.avgPrice or 0.0
                     volume = round(qty * px, 6)
 
                     payload = {
-                        "v": volume,                       # стоимость позиции
-                        "cv": volume,                      # текущая стоимость (в mock = v)
-                        "sym": pos.symbol,                 # тикер, например "APTK"
-                        "tic": f"{exchange}:{pos.symbol}", # "MOEX:APTK"
-                        "p": portfolio,                    # портфель
-                        "ex": exchange,                    # биржа
+                        "v": volume,
+                        "cv": volume,
+                        "sym": pos.symbol,
+                        "tic": f"{exchange}:{pos.symbol}",
+                        "p": portfolio,
+                        "ex": exchange,
 
-                        "pxavg": px,                       # средняя цена
-                        "q": qty,                          # текущий остаток
-                        "o": qty,                          # исходный объём (в mock = q)
-                        "lot": 1,                          # размер лота (захардкожен)
-                        "n": pos.symbol,                   # имя инструмента (в mock = тикер)
+                        "pxavg": px,
+                        "q": qty,
+                        "o": qty,
+                        "lot": 1,
+                        "n": pos.symbol,
 
-                        "q0": qty,                         # нач. остаток
-                        "q1": qty,                         # на начало дня
-                        "q2": qty,                         # на конец дня
-                        "qf": qty,                         # фактический остаток
+                        "q0": qty,
+                        "q1": qty,
+                        "q2": qty,
+                        "qf": qty,
 
-                        "upd": 0.0,                        # изменение стоимости (mock)
-                        "up": pos.pnl or 0.0,              # PnL
-                        "cur": False,                      # валютная? (mock)
-                        "h": True,                         # позиция активна
+                        "upd": 0.0,
+                        "up": pos.pnl or 0.0,
+                        "cur": False,
+                        "h": True,
                     }
 
                     await ws.send_json({"data": payload, "guid": guid})
 
                 asyncio.create_task(
                     adapter.subscribe_positions(
-                        symbols,  # если пусто — mock использует все инструменты
+                        symbols,
                         lambda p: asyncio.create_task(on_pos_opcode(p)),
                         stop,
                     )
                 )
                 continue
-
-            # другие opcode...
-            
-            # неизвестный opcode игнорируем
 
     except WebSocketDisconnect:
         for lst in active.values():
