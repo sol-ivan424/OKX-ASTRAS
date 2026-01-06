@@ -1,3 +1,5 @@
+# api/server.py
+
 import os
 import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -150,7 +152,7 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
-            # свечи (история)
+            # свечи (история + подписка)
             if opcode == "BarsGetAndSubscribe":
                 stop = asyncio.Event()
                 active["bars"].append(stop)
@@ -159,16 +161,48 @@ async def stream(ws: WebSocket):
                 tf = str(msg.get("tf", "60"))
                 from_ts = int(msg.get("from", int(time.time())))
                 skip_history = bool(msg.get("skipHistory", False))
-                split_adjust = bool(msg.get("splitAdjust", True))
+                split_adjust = bool(msg.get("splitAdjust", True))  #адаптер игнорирует
                 guid = msg.get("guid") or req_guid
 
-                async def on_bar(bar: dict):
+                exchange = msg.get("exchange")  #адаптер игнорирует
+                instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
+                data_format = msg.get("format")  #адаптер игнорирует
+                frequency = msg.get("frequency")  #адаптер игнорирует
+
+                async def send_bar_astras(bar: dict):
+                    ts_ms = bar.get("ts", 0)
+                    try:
+                        t_sec = int(int(ts_ms) / 1000)
+                    except Exception:
+                        t_sec = 0
+
+                    payload = {
+                        "time": t_sec,
+                        "close": bar.get("close", 0),
+                        "open": bar.get("open", 0),
+                        "high": bar.get("high", 0),
+                        "low": bar.get("low", 0),
+                        "volume": bar.get("volume", 0),
+                    }
+
                     await ws.send_json({
-                        "data": bar,
+                        "data": payload,
                         "guid": guid,
                     })
 
                 if code:
+                    if (not skip_history) and hasattr(adapter, "get_bars_history"):
+                        try:
+                            history = await adapter.get_bars_history(
+                                symbol=code,
+                                tf=tf,
+                                from_ts=from_ts,
+                            )
+                            for hbar in history:
+                                await send_bar_astras(hbar)
+                        except Exception:
+                            pass
+
                     asyncio.create_task(
                         adapter.subscribe_bars(
                             symbol=code,
@@ -176,7 +210,7 @@ async def stream(ws: WebSocket):
                             from_ts=from_ts,
                             skip_history=skip_history,
                             split_adjust=split_adjust,
-                            on_data=lambda b: asyncio.create_task(on_bar(b)),
+                            on_data=lambda b: asyncio.create_task(send_bar_astras(b)),
                             stop_event=stop,
                         )
                     )
