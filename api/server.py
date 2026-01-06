@@ -152,7 +152,7 @@ async def stream(ws: WebSocket):
                 )
                 continue
 
-            # свечи (история + подписка)
+            # свечи (история + подписка). присылаются и открытые и закрытые свечи (confirm == 0,1)
             if opcode == "BarsGetAndSubscribe":
                 stop = asyncio.Event()
                 active["bars"].append(stop)
