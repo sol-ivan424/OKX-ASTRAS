@@ -48,4 +48,8 @@ async def main():
     await a.close()
 
 
+<<<<<<< HEAD
 asyncio.run(main())
+=======
+asyncio.run(main())
+>>>>>>> 9dce9d62bafd68df2017e072cf510512f3dfb220
