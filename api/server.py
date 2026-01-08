@@ -7,8 +7,6 @@ from typing import List
 import asyncio
 import datetime
 
-from api.schemas import Order
-from adapters.mock_adapter import MockAdapter
 from adapters.okx_adapter import OkxAdapter
 
 from dotenv import load_dotenv
@@ -16,7 +14,7 @@ load_dotenv()
 
 
 def _make_adapter():
-    name = os.getenv("ADAPTER", "mock").lower()
+    name = os.getenv("ADAPTER", "okx").lower()
 
     if name == "okx":
         return OkxAdapter(
@@ -25,7 +23,7 @@ def _make_adapter():
             api_passphrase=os.getenv("OKX_API_PASSPHRASE"),
         )
 
-    return MockAdapter()
+    raise RuntimeError("Поддерживается только ADAPTER=okx")
 
 
 app = FastAPI(title="Astras Crypto Gateway")
@@ -99,6 +97,69 @@ def _astras_instrument_simple(d: dict) -> dict:
         "complexProductCategory": d.get("complexProductCategory", 0),
         "priceMultiplier": price_multiplier,
         "priceShownUnits": price_shown_units,
+    }
+
+
+def _iso_from_unix_ms(ts_ms: int) -> str:
+    try:
+        dt = datetime.datetime.utcfromtimestamp(int(ts_ms) / 1000.0)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except Exception:
+        return "0"
+
+
+def _astras_order_simple_from_okx_neutral(
+    o: dict,
+    exchange: str,
+    portfolio: str,
+) -> dict:
+    symbol = o.get("symbol", "0")
+    price = o.get("price", 0) or 0
+    qty = o.get("qty", 0) or 0
+    filled = o.get("filled", 0) or 0
+
+    try:
+        volume = float(price) * float(qty)
+    except Exception:
+        volume = 0
+
+    trans_time = _iso_from_unix_ms(int(o.get("ts_create", 0) or 0))
+    update_time = _iso_from_unix_ms(int(o.get("ts_update", 0) or 0))
+
+    broker_symbol = 0
+    if exchange != "0" and symbol != "0":
+        broker_symbol = f"{exchange}:{symbol}"
+
+    return {
+        "id": o.get("id", "0"),
+        "symbol": symbol,
+        "brokerSymbol": broker_symbol,
+        "portfolio": portfolio,
+        "exchange": exchange,
+        "comment": 0,
+
+        "type": o.get("type", "0"),
+        "side": o.get("side", "0"),
+        "status": o.get("status", "0"),
+
+        "transTime": trans_time,
+        "updateTime": update_time,
+        "endTime": "0",
+
+        "qtyUnits": 0,
+        "qtyBatch": 0,
+        "qty": qty,
+
+        "filledQtyUnits": 0,
+        "filledQtyBatch": 0,
+        "filled": filled,
+
+        "price": price,
+        "existing": 0,
+        "timeInForce": "0",
+        "iceberg": 0,
+
+        "volume": volume,
     }
 
 
@@ -216,62 +277,53 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
-            # все заявки по портфелю
+            # все заявки по портфелю (история + подписка) в Astras Simple
             if opcode == "OrdersGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["orders"].append(stop)
 
-                exchange = msg.get("exchange") or "MOCK"
-                portfolio = msg.get("portfolio") or "PORTF"
+                exchange = msg.get("exchange") or "0"
+                portfolio = msg.get("portfolio") or "0"
+
                 statuses = msg.get("orderStatuses") or []
                 skip_history = bool(msg.get("skipHistory", False))
                 guid = msg.get("guid") or req_guid
 
-                def _order_to_simple(o: Order) -> dict:
-                    ts_sec = o.ts / 1000.0
-                    tt = datetime.datetime.utcfromtimestamp(ts_sec).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                    et = (
-                        datetime.datetime.utcfromtimestamp(ts_sec)
-                        + datetime.timedelta(days=1)
-                    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                    qty = o.quantity
-                    px = o.price or 0.0
-                    volume = round(px * qty, 5) if px and qty else 0.0
-                    return {
-                        "id": o.id,
-                        "sym": o.symbol,
-                        "tic": f"{exchange}:{o.symbol}",
-                        "p": portfolio,
-                        "ex": exchange,
-                        "cmt": None,
-                        "t": o.type,
-                        "s": o.side,
-                        "st": o.status,
-                        "tt": tt,
-                        "ut": tt,
-                        "et": et,
-                        "q": qty,
-                        "qb": qty,
-                        "fq": o.filledQuantity,
-                        "fqb": o.filledQuantity,
-                        "px": px,
-                        "h": False,
-                        "tf": "oneday",
-                        "i": None,
-                        "v": volume,
-                    }
+                instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
+                data_format = msg.get("format")  #адаптер игнорирует
+                frequency = msg.get("frequency")  #адаптер игнорирует
 
-                async def on_order_v2(o: Order):
+                async def send_order_astras(order_any: dict):
+                    payload = _astras_order_simple_from_okx_neutral(
+                        order_any,
+                        exchange=exchange,
+                        portfolio=portfolio,
+                    )
+
                     if statuses:
-                        if o.status not in statuses:
+                        st = payload.get("status", "0")
+                        if st not in statuses:
                             return
-                    payload = _order_to_simple(o)
+
                     await ws.send_json({"data": payload, "guid": guid})
+
+                # история заявок (pending) через REST, если доступно и если skipHistory=false
+                if (not skip_history) and hasattr(adapter, "get_orders_pending"):
+                    try:
+                        inst_id = symbols[0] if symbols else None
+                        history_orders = await adapter.get_orders_pending(
+                            inst_type="SPOT",
+                            inst_id=inst_id,
+                        )
+                        for ho in history_orders:
+                            await send_order_astras(ho)
+                    except Exception:
+                        pass
 
                 asyncio.create_task(
                     adapter.subscribe_orders(
                         symbols,
-                        lambda ord_: asyncio.create_task(on_order_v2(ord_)),
+                        lambda ord_: asyncio.create_task(send_order_astras(ord_)),
                         stop,
                     )
                 )

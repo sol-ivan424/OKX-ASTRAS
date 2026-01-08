@@ -20,11 +20,13 @@ class OkxAdapter:
     - публичные REST-запросы (например, список инструментов)
     - приватные REST-запросы с подписью (например, проверка API-ключей)
     - публичные WS-подписки (например, свечи)
+    - приватные WS-подписки (например, заявки)
 
     Никаких Astras-форматов здесь нет: адаптер только получает данные OKX
     и возвращает их в нейтральном виде для server.py.
     """
 
+    #инициализация адаптера
     def __init__(
         self,
         rest_base: str = "https://www.okx.com",
@@ -42,41 +44,30 @@ class OkxAdapter:
 
         self._http_client: Optional[httpx.AsyncClient] = None
 
+        #публичный WS (business) для свечей
         self._ws_business_url = "wss://ws.okx.com:8443/ws/v5/business"
+        #приватный WS для заявок
+        self._ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
 
-    async def _get_http_client(self) -> httpx.AsyncClient:
-        """Ленивая инициализация HTTP-клиента."""
-        if self._http_client is None:
-            self._http_client = httpx.AsyncClient(
-                base_url=self._rest_base,
-                timeout=httpx.Timeout(10.0, connect=5.0),
-            )
-        return self._http_client
+    #универсальное преобразование в float (если нет значения -> 0.0)
+    def _to_float(self, v: Any) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
 
-    async def close(self) -> None:
-        """Корректно закрывает HTTP-клиент."""
-        if self._http_client is not None:
-            await self._http_client.aclose()
-            self._http_client = None
+    #универсальное преобразование в int (если нет значения -> 0)
+    def _to_int(self, v: Any) -> int:
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return 0
 
-    def _normalize_path(self, path: str) -> str:
-        """Приводит путь к формату /api/v5/..."""
-        if not path.startswith("/"):
-            path = "/" + path
-        if not path.startswith("/api/"):
-            path = "/api/v5" + path
-        return path
-
-    def _sign_request(self, timestamp: str, method: str, request_path: str, body: str) -> str:
-        """
-        Формирует подпись OKX для приватного запроса.
-
-        sign = Base64( HMAC_SHA256( timestamp + method + request_path + body ) )
-        """
+    #подпись HMAC-SHA256 + Base64 (общая крипто-часть для REST и WS)
+    def _hmac_sha256_base64(self, message: str) -> str:
         if not self._api_secret:
             raise RuntimeError("OKX API secret не задан")
 
-        message = timestamp + method.upper() + request_path + body
         mac = hmac.new(
             self._api_secret.encode("utf-8"),
             message.encode("utf-8"),
@@ -84,6 +75,52 @@ class OkxAdapter:
         )
         return base64.b64encode(mac.digest()).decode()
 
+    #timestamp для REST (ISO8601 с миллисекундами)
+    def _rest_timestamp(self) -> str:
+        return (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    #timestamp для WS login (секунды)
+    def _ws_timestamp(self) -> str:
+        return str(int(datetime.now(timezone.utc).timestamp()))
+
+    #ленивая инициализация HTTP-клиента
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                base_url=self._rest_base,
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+        return self._http_client
+
+    #корректное закрытие HTTP-клиента
+    async def close(self) -> None:
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    #нормализация пути к /api/v5/...
+    def _normalize_path(self, path: str) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
+        if not path.startswith("/api/"):
+            path = "/api/v5" + path
+        return path
+
+    #формирование подписи OKX для приватного REST запроса
+    def _sign_request(self, timestamp: str, method: str, request_path: str, body: str) -> str:
+        """
+        Формирует подпись OKX для приватного запроса.
+
+        sign = Base64( HMAC_SHA256( timestamp + method + request_path + body ) )
+        """
+        message = timestamp + method.upper() + request_path + body
+        return self._hmac_sha256_base64(message)
+
+    #базовые заголовки (demo mode)
     def _base_headers(self) -> Dict[str, str]:
         """
         Базовые заголовки.
@@ -94,12 +131,12 @@ class OkxAdapter:
             headers["x-simulated-trading"] = "1"
         return headers
 
+    #публичный REST-запрос к OKX
     async def _request_public(
         self,
         path: str,
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Публичный REST-запрос к OKX."""
         client = await self._get_http_client()
         path = self._normalize_path(path)
 
@@ -111,6 +148,7 @@ class OkxAdapter:
             raise RuntimeError(f"OKX error {data.get('code')}: {data.get('msg')}")
         return data
 
+    #приватный REST-запрос к OKX с подписью
     async def _request_private(
         self,
         method: str,
@@ -118,20 +156,15 @@ class OkxAdapter:
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Приватный REST-запрос к OKX с подписью."""
         if not self._api_key or not self._api_secret or not self._api_passphrase:
             raise RuntimeError("OKX API ключи не заданы")
 
         client = await self._get_http_client()
         path = self._normalize_path(path)
 
-        timestamp = (
-            datetime.now(timezone.utc)
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z")
-        )
-
+        timestamp = self._rest_timestamp()
         body_str = json.dumps(body) if body else ""
+
         sign = self._sign_request(
             timestamp=timestamp,
             method=method,
@@ -162,14 +195,14 @@ class OkxAdapter:
             raise RuntimeError(f"OKX error {data.get('code')}: {data.get('msg')}")
         return data
 
+    #проверка валидности API-ключей
     async def check_api_keys(self) -> None:
-        """Проверка валидности API-ключей безопасным запросом."""
         await self._request_private("GET", "/account/balance")
 
+    #получение списка инструментов OKX
     async def list_instruments(self, inst_type: str = "SPOT") -> List[dict]:
         """
         Возвращает инструменты OKX в нейтральном формате:
-
         symbol, exchange, instType, state, baseCcy, quoteCcy, lotSz, tickSz
         """
         raw = await self._request_public(
@@ -177,7 +210,7 @@ class OkxAdapter:
             params={"instType": inst_type},
         )
 
-        def to_float(v: Any) -> Optional[float]:
+        def to_opt_float(v: Any) -> Optional[float]:
             try:
                 return float(v)
             except (TypeError, ValueError):
@@ -193,19 +226,14 @@ class OkxAdapter:
                     "state": item.get("state"),
                     "baseCcy": item.get("baseCcy"),
                     "quoteCcy": item.get("quoteCcy"),
-                    "lotSz": to_float(item.get("lotSz")),
-                    "tickSz": to_float(item.get("tickSz")),
+                    "lotSz": to_opt_float(item.get("lotSz")),
+                    "tickSz": to_opt_float(item.get("tickSz")),
                 }
             )
         return out
 
+    #маппинг таймфрейма Astras (секунды) -> OKX bar
     def _tf_to_okx_bar(self, tf: str) -> str:
-        """
-        Преобразует таймфрейм из запроса Astras в значение OKX bar.
-
-        В Astras у тебя чаще всего tf в секундах строкой: "60", "300", "3600".
-        В OKX REST bar: "1m", "5m", "1H", "1D", ...
-        """
         tf = str(tf).strip()
         mapping = {
             "1": "1s",
@@ -224,46 +252,30 @@ class OkxAdapter:
         }
         return mapping.get(tf, "1m")
 
+    #маппинг таймфрейма Astras (секунды) -> OKX WS candle channel
     def _tf_to_okx_ws_channel(self, tf: str) -> str:
-        """
-        Преобразует таймфрейм Astras в канал OKX WS candle.
-        Пример: "60" -> "candle1m", "3600" -> "candle1H".
-        """
         bar = self._tf_to_okx_bar(tf)
         return "candle" + bar
 
+    #универсальный парсер свечи OKX (WS и REST)
     def _parse_okx_candle_any(self, symbol: str, arr: list) -> dict:
         """
-        Универсальный парсер свечи OKX для WS и REST.
-
-        WS обычно: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
-        REST history-candles обычно: [ts,o,h,l,c,vol,volCcy,confirm]
-        ts в миллисекундах.
+        WS: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
+        REST history-candles: [ts,o,h,l,c,vol,volCcy,confirm]
+        ts в миллисекундах
         """
-        def to_float(v: Any) -> float:
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return 0.0
-
-        def to_int(v: Any) -> int:
-            try:
-                return int(float(v))
-            except (TypeError, ValueError):
-                return 0
-
-        ts_ms = to_int(arr[0]) if len(arr) > 0 else 0
-        o = to_float(arr[1]) if len(arr) > 1 else 0.0
-        h = to_float(arr[2]) if len(arr) > 2 else 0.0
-        l = to_float(arr[3]) if len(arr) > 3 else 0.0
-        c = to_float(arr[4]) if len(arr) > 4 else 0.0
-        vol = to_float(arr[5]) if len(arr) > 5 else 0.0
+        ts_ms = self._to_int(arr[0]) if len(arr) > 0 else 0
+        o = self._to_float(arr[1]) if len(arr) > 1 else 0.0
+        h = self._to_float(arr[2]) if len(arr) > 2 else 0.0
+        l = self._to_float(arr[3]) if len(arr) > 3 else 0.0
+        c = self._to_float(arr[4]) if len(arr) > 4 else 0.0
+        vol = self._to_float(arr[5]) if len(arr) > 5 else 0.0
 
         confirm = 0
         if len(arr) >= 9:
-            confirm = to_int(arr[8])
+            confirm = self._to_int(arr[8])
         elif len(arr) >= 8:
-            confirm = to_int(arr[7])
+            confirm = self._to_int(arr[7])
 
         return {
             "symbol": symbol,
@@ -276,6 +288,7 @@ class OkxAdapter:
             "confirm": confirm,
         }
 
+    #получение истории свечей через REST /market/history-candles
     async def get_bars_history(
         self,
         symbol: str,
@@ -284,14 +297,6 @@ class OkxAdapter:
         limit_per_request: int = 100,
         max_requests: int = 20,
     ) -> List[dict]:
-        """
-        История свечей через REST OKX /market/history-candles.
-
-        Возвращает нейтральный формат:
-        symbol, ts(ms), open, high, low, close, volume, confirm
-
-        from_ts ожидается в секундах Unix (как приходит от Astras).
-        """
         bar = self._tf_to_okx_bar(tf)
         from_ms = int(from_ts) * 1000
 
@@ -342,6 +347,7 @@ class OkxAdapter:
         collected.sort(key=lambda x: int(x.get("ts", 0)))
         return collected
 
+    #подписка на свечи через WS
     async def subscribe_bars(
         self,
         symbol: str,
@@ -352,15 +358,6 @@ class OkxAdapter:
         on_data: Callable[[dict], Any],
         stop_event: asyncio.Event,
     ) -> None:
-        """
-        Подписка на свечи через WS.
-
-        Адаптер отдаёт нейтральный формат:
-        symbol, ts(ms), open, high, low, close, volume, confirm
-
-        from_ts/skip_history/split_adjust здесь не используются для OKX WS.
-        Историю отдаём отдельным REST методом get_bars_history.
-        """
         channel = self._tf_to_okx_ws_channel(tf)
 
         sub_msg = {
@@ -391,6 +388,147 @@ class OkxAdapter:
                         for candle_arr in data:
                             bar = self._parse_okx_candle_any(symbol, candle_arr)
                             res = on_data(bar)
+                            if asyncio.iscoroutine(res):
+                                await res
+
+            except Exception:
+                await asyncio.sleep(1.0)
+                continue
+
+    #формирование payload login для приватного WS OKX
+    def _ws_login_payload(self) -> Dict[str, Any]:
+        """
+        OKX WS login:
+        sign = Base64( HMAC_SHA256( timestamp + "GET" + "/users/self/verify" ) )
+        timestamp в секундах строкой
+        """
+        if not self._api_key or not self._api_secret or not self._api_passphrase:
+            raise RuntimeError("OKX API ключи не заданы")
+
+        ts = self._ws_timestamp()
+        prehash = ts + "GET" + "/users/self/verify"
+        sign = self._hmac_sha256_base64(prehash)
+
+        return {
+            "op": "login",
+            "args": [
+                {
+                    "apiKey": self._api_key,
+                    "passphrase": self._api_passphrase,
+                    "timestamp": ts,
+                    "sign": sign,
+                }
+            ],
+        }
+
+    #парсер ордера OKX (REST и WS) в нейтральный формат
+    def _parse_okx_order_any(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Нейтральный формат ордера:
+        id, symbol, type, side, status, price, qty, filled, ts_create(ms), ts_update(ms)
+        """
+        ord_id = d.get("ordId") or "0"
+        inst_id = d.get("instId") or "0"
+
+        ord_type = d.get("ordType") or "0"
+        side = d.get("side") or "0"
+        state = d.get("state") or "0"
+
+        px = self._to_float(d.get("px"))
+        sz = self._to_float(d.get("sz"))
+        fill_sz = self._to_float(d.get("fillSz"))
+
+        c_time = self._to_int(d.get("cTime"))
+        u_time = self._to_int(d.get("uTime"))
+
+        return {
+            "id": ord_id,
+            "symbol": inst_id,
+            "type": ord_type,
+            "side": side,
+            "status": state,
+            "price": px,
+            "qty": sz,
+            "filled": fill_sz,
+            "ts_create": c_time,
+            "ts_update": u_time,
+        }
+
+    #REST: активные заявки (pending)
+    async def get_orders_pending(
+        self,
+        inst_type: str = "SPOT",
+        inst_id: Optional[str] = None,
+        ord_type: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"instType": inst_type, "limit": str(int(limit))}
+        if inst_id:
+            params["instId"] = inst_id
+        if ord_type:
+            params["ordType"] = ord_type
+        if state:
+            params["state"] = state
+
+        raw = await self._request_private("GET", "/trade/orders-pending", params=params)
+        out: List[Dict[str, Any]] = []
+        for item in raw.get("data", []):
+            out.append(self._parse_okx_order_any(item))
+        return out
+
+    #WS: подписка на изменения заявок (private channel orders)
+    async def subscribe_orders(
+        self,
+        symbols: List[str],
+        on_data: Callable[[Dict[str, Any]], Any],
+        stop_event: asyncio.Event,
+        inst_type: str = "SPOT",
+    ) -> None:
+        login_msg = self._ws_login_payload()
+
+        sub_args: Dict[str, Any] = {"channel": "orders", "instType": inst_type}
+        sub_msg = {"op": "subscribe", "args": [sub_args]}
+
+        while not stop_event.is_set():
+            try:
+                async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
+                    await ws.send(json.dumps(login_msg))
+
+                    #ждём подтверждение login
+                    authed = False
+                    login_deadline = asyncio.get_event_loop().time() + 5.0
+                    while not authed and not stop_event.is_set():
+                        if asyncio.get_event_loop().time() > login_deadline:
+                            raise RuntimeError("OKX WS login timeout")
+
+                        raw = await ws.recv()
+                        msg = json.loads(raw)
+                        if msg.get("event") == "login":
+                            if msg.get("code") == "0":
+                                authed = True
+                                break
+                            raise RuntimeError(f"OKX WS login error: {msg}")
+
+                    await ws.send(json.dumps(sub_msg))
+
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        msg = json.loads(raw)
+                        if msg.get("event") == "error":
+                            return
+
+                        data = msg.get("data")
+                        if not data:
+                            continue
+
+                        for item in data:
+                            order = self._parse_okx_order_any(item)
+                            res = on_data(order)
                             if asyncio.iscoroutine(res):
                                 await res
 
