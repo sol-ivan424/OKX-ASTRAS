@@ -7,6 +7,7 @@ import hashlib
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Callable
+from urllib.parse import urlencode
 
 import httpx
 import websockets
@@ -131,6 +132,16 @@ class OkxAdapter:
             headers["x-simulated-trading"] = "1"
         return headers
 
+    #сборка query string для подписи (должна совпасть с тем, что реально уйдет в запрос)
+    def _build_query_string(self, params: Dict[str, Any]) -> str:
+        items = []
+        for k in sorted(params.keys()):
+            v = params[k]
+            if v is None:
+                continue
+            items.append((k, str(v)))
+        return urlencode(items)
+
     #публичный REST-запрос к OKX
     async def _request_public(
         self,
@@ -165,10 +176,20 @@ class OkxAdapter:
         timestamp = self._rest_timestamp()
         body_str = json.dumps(body) if body else ""
 
+        #важно: для OKX подпись должна включать query string, если она есть
+        request_path_for_sign = path
+        request_url = path
+
+        if params:
+            qs = self._build_query_string(params)
+            if qs:
+                request_path_for_sign = f"{path}?{qs}"
+                request_url = f"{path}?{qs}"
+
         sign = self._sign_request(
             timestamp=timestamp,
             method=method,
-            request_path=path,
+            request_path=request_path_for_sign,
             body=body_str,
         )
 
@@ -181,10 +202,11 @@ class OkxAdapter:
             **self._base_headers(),
         }
 
+        #params не передаем отдельно, чтобы кодирование query совпало с тем, что подписали
         resp = await client.request(
             method.upper(),
-            path,
-            params=params,
+            request_url,
+            params=None,
             content=body_str if body else None,
             headers=headers,
         )
