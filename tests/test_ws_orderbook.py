@@ -169,6 +169,81 @@ def test_ws_orderbook_frequency_throttling():
     asyncio.run(run())
 
 
+# Дополнительные проверки корректности стакана: спред, числа, монотонность времени.
+def test_ws_orderbook_format_and_sanity_checks():
+    """
+    Дополнительные проверки корректности стакана в формате Astras Simple:
+    - лучший bid <= лучшего ask (неотрицательный спред)
+    - price/volume неотрицательные и конечные числа
+    - ms_timestamp не убывает от сообщения к сообщению
+    """
+    async def run():
+        uri = "ws://127.0.0.1:8000/stream"
+
+        guid = "test-orderbook-sanity"
+        depth = 10
+
+        req = {
+            "opcode": "OrderBookGetAndSubscribe",
+            "exchange": "MOEX",              # адаптер игнорирует
+            "code": "BTC-USDT",              # OKX instId
+            "instrumentGroup": "TQBR",       # адаптер игнорирует
+            "depth": depth,
+            "format": "Simple",              # адаптер игнорирует
+            "frequency": 25,
+            "guid": guid,
+            "token": "test-token",
+        }
+
+        def _is_finite_number(x) -> bool:
+            return isinstance(x, (int, float)) and x == x and x not in (float("inf"), float("-inf"))
+
+        async with websockets.connect(uri) as ws:
+            await ws.send(json.dumps(req))
+
+            last_ms = 0
+            # проверим несколько сообщений: snapshot + update(ы)
+            for _ in range(3):
+                msg = await _recv_one(ws, timeout_sec=30.0)
+                assert msg.get("guid") == guid
+
+                data = msg.get("data") or {}
+                bids = data.get("bids") or []
+                asks = data.get("asks") or []
+
+                ms_ts = int(data.get("ms_timestamp", 0) or 0)
+                assert ms_ts > 0
+                assert ms_ts >= last_ms
+                last_ms = ms_ts
+
+                # bids/asks должны быть списками объектов с price/volume
+                assert isinstance(bids, list)
+                assert isinstance(asks, list)
+
+                if bids and asks:
+                    assert bids[0]["price"] <= asks[0]["price"]
+
+                # sanity по значениям
+                for side in (bids, asks):
+                    for lvl in side:
+                        p = lvl.get("price")
+                        v = lvl.get("volume")
+
+                        assert _is_finite_number(p)
+                        assert _is_finite_number(v)
+
+                        assert p >= 0
+                        assert v >= 0
+
+                # проверим применение depth: если уровней достаточно, сервер режет до depth
+                if len(bids) > 0:
+                    assert len(bids) <= depth
+                if len(asks) > 0:
+                    assert len(asks) <= depth
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     async def _demo():
         uri = "ws://127.0.0.1:8000/stream"

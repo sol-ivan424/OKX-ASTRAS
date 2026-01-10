@@ -351,6 +351,36 @@ class OkxAdapter:
             "existing": bool(existing),
         }
 
+    #универсальный парсер котировки OKX (WS tickers) в нейтральный формат
+    def _parse_okx_ticker_any(self, symbol: str, item: Dict[str, Any]) -> dict:
+        
+        ts_ms = self._to_int(item.get("ts"))
+
+        last = self._to_float(item.get("last"))
+        bid_px = self._to_float(item.get("bidPx"))
+        ask_px = self._to_float(item.get("askPx"))
+
+        bid_sz = self._to_float(item.get("bidSz"))
+        ask_sz = self._to_float(item.get("askSz"))
+
+        high_24h = self._to_float(item.get("high24h"))
+        low_24h = self._to_float(item.get("low24h"))
+
+        vol_24h_base = self._to_float(item.get("vol24h"))
+
+        return {
+            "symbol": symbol,
+            "ts": ts_ms,
+            "last": last,
+            "bid": bid_px,
+            "ask": ask_px,
+            "bid_sz": bid_sz,
+            "ask_sz": ask_sz,
+            "high24h": high_24h,
+            "low24h": low_24h,
+            "vol24h": vol_24h_base,
+        }
+
     #получение истории свечей через REST /market/history-candles
     async def get_bars_history(
         self,
@@ -667,6 +697,70 @@ class OkxAdapter:
 
 
                             res = on_data(book)
+                            if asyncio.iscoroutine(res):
+                                await res
+
+            except Exception:
+                await asyncio.sleep(1.0)
+                continue
+
+    #WS: подписка на котировки (public channel tickers)
+    async def subscribe_quotes(
+        self,
+        symbol: str,
+        on_data: Callable[[dict], Any],
+        stop_event: asyncio.Event,
+    ) -> None:
+        """
+        Подписка на котировки OKX через WS tickers.
+        Возвращает нейтральный формат для server.py:
+        {
+          "symbol": "...",
+          "ts": <ms>,
+          "last": <float>,
+          "bid": <float>,
+          "ask": <float>,
+          "bid_sz": <float>,
+          "ask_sz": <float>,
+          "high24h": <float>,
+          "low24h": <float>,
+          "vol24h": <float>   # объём в базовой валюте за 24ч
+        }
+        """
+
+        sub_msg = {
+            "op": "subscribe",
+            "args": [
+                {
+                    "channel": "tickers",
+                    "instId": symbol,
+                }
+            ],
+        }
+
+        while not stop_event.is_set():
+            try:
+                async with websockets.connect(self._ws_public_url, ping_interval=20, ping_timeout=20) as ws:
+                    await ws.send(json.dumps(sub_msg))
+
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        msg = json.loads(raw)
+
+                        if msg.get("event") == "error":
+                            return
+
+                        data = msg.get("data")
+                        if not data:
+                            continue
+
+                        for item in data:
+                            t = self._parse_okx_ticker_any(symbol, item)
+                            res = on_data(t)
                             if asyncio.iscoroutine(res):
                                 await res
 

@@ -5,6 +5,11 @@
 
 1. в заявках отдаем qty дробным, хотя Astras ждет int32
 2. bids[].volume и asks[].volume отдаются float, Astras ждет int64
+3. volume, ask_vol, bid_vol в котировках может быть дробный, астрас ждет int64 (в базовой валюте)
+4. open_price в котировках нет, можно сделать pen24h в tickers (цена 24h назад)
+5. total_bid_vol, total_ask_vol пока 0. Строго можно посчитать сумму объёмов по тем уровням стакана, которые реально получаешь (например, depth=10/20/50). Это будет “сумма по полученной глубине”, а не “по всему стакану”, потому что полный стакан OKX не отдаёт. Если Astras ожидает именно “по всем уровням”, тогда строго это невозможно и надо ставить 0. 
+Если допускается “по стакану, который вы получаете по подписке” (как в OrderBookGetAndSubscribe), тогда считаем сумму по полученным уровням.
+6.  отдается за 24 часа "high_price": high_price, "low_price": low_price,
 """
 
 
@@ -497,30 +502,116 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
-            # котировки инструмента
+            # котировки инструмента (Astras Simple)
             if opcode == "QuotesSubscribe":
                 stop = asyncio.Event()
                 active["quotes"].append(stop)
 
                 code = msg.get("code")
-                group = msg.get("instrumentGroup")
-                symbol = code or (symbols[0] if symbols else "")
+                instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
+                data_format = msg.get("format")  #адаптер игнорирует
 
+                frequency = int(msg.get("frequency", 25) or 25)
                 guid = msg.get("guid") or req_guid
 
-                async def on_quote_opcode(q):
-                    await send_wrapped(
-                        "quotes",
-                        q,
-                        guid or f"quotes:{getattr(q, 'symbol', '')}",
-                    )
+                exchange_out = "OKX"
+
+                symbol = code or (symbols[0] if symbols else "")
+
+                # троттлинг: не отправлять чаще, чем раз в frequency мс
+                last_sent_ms = 0
+
+                async def send_quote_astras(t: dict):
+                    nonlocal last_sent_ms
+
+                    now_ms = int(time.time() * 1000)
+                    if frequency > 0 and (now_ms - last_sent_ms) < frequency:
+                        return
+                    last_sent_ms = now_ms
+
+                    # t (нейтральный формат от адаптера subscribe_quotes):
+                    # {
+                    #   "symbol": "...",
+                    #   "ts": <ms>,
+                    #   "last": <float>,
+                    #   "bid": <float>,
+                    #   "ask": <float>,
+                    #   "bid_sz": <float>,
+                    #   "ask_sz": <float>,
+                    #   "high24h": <float>,
+                    #   "low24h": <float>,
+                    #   "vol24h": <float>
+                    # }
+
+                    ts_ms = int(t.get("ts", 0) or 0)
+                    ts_sec = int(ts_ms / 1000) if ts_ms else 0
+
+                    last_price = t.get("last", 0) or 0
+                    bid = t.get("bid", 0) or 0
+                    ask = t.get("ask", 0) or 0
+
+                    bid_sz = t.get("bid_sz", 0) or 0
+                    ask_sz = t.get("ask_sz", 0) or 0
+
+                    high_price = t.get("high24h", 0) or 0
+                    low_price = t.get("low24h", 0) or 0
+
+                    # volume: в базовой валюте (OKX vol24h). Если OKX отдаёт дробь — отдаём дробь.
+                    volume = t.get("vol24h", 0) or 0
+
+                    payload = {
+                        "symbol": symbol,
+                        "exchange": exchange_out,
+                        "description": None,
+
+                        "prev_close_price": None,
+
+                        "last_price": last_price,
+                        "last_price_timestamp": ts_sec,
+
+                        # high/low: 24h high/low от OKX
+                        "high_price": high_price,
+                        "low_price": low_price,
+
+                        "accruedInt": 0,
+                        "volume": volume,
+
+                        "open_interest": None,
+
+                        "ask": ask,
+                        "bid": bid,
+
+                        "ask_vol": ask_sz,
+                        "bid_vol": bid_sz,
+
+                        "ob_ms_timestamp": None,
+
+                        "open_price": 0,
+                        "yield": None,
+
+                        "lotsize": 0,
+                        "lotvalue": 0,
+                        "facevalue": 0,
+                        "type": "0",
+
+                        "total_bid_vol": 0,
+                        "total_ask_vol": 0,
+
+                        "accrued_interest": 0,
+
+                        # change/change_percent зависят от prev_close_price; при null -> 0
+                        "change": 0,
+                        "change_percent": 0,
+                    }
+
+                    await ws.send_json({"data": payload, "guid": guid})
 
                 if symbol:
                     asyncio.create_task(
                         adapter.subscribe_quotes(
-                            [symbol],
-                            lambda q: asyncio.create_task(on_quote_opcode(q)),
-                            stop,
+                            symbol=symbol,
+                            on_data=lambda q: asyncio.create_task(send_quote_astras(q)),
+                            stop_event=stop,
                         )
                     )
                 continue
