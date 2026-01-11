@@ -553,6 +553,57 @@ class OkxAdapter:
             "tif": tif,
         }
 
+    #парсер сделки OKX (fills) из REST и WS orders в нейтральный формат
+    def _parse_okx_trade_any(self, d: Dict[str, Any], is_history: bool) -> Dict[str, Any]:
+        """
+        Нейтральный формат сделки (исполнения):
+        id, orderno, comment, symbol, side, price, qty_units, qty, ts(ms), commission, fee_ccy, is_history
+        """
+
+        trade_id = d.get("tradeId") or d.get("billId") or "0"
+        ord_id = d.get("ordId") or "0"
+        inst_id = d.get("instId") or "0"
+
+        side = d.get("side") or "0"
+
+        # цена и количество исполнения
+        fill_px = self._to_float(d.get("fillPx") if d.get("fillPx") is not None else d.get("px"))
+        fill_sz = self._to_float(d.get("fillSz") if d.get("fillSz") is not None else d.get("sz"))
+
+        # время исполнения (мс)
+        ts_ms = self._to_int(
+            d.get("fillTime") if d.get("fillTime") is not None else d.get("ts")
+        )
+        if ts_ms <= 0:
+            # fallback: uTime/cTime, если fillTime/ts нет
+            ts_ms = self._to_int(d.get("uTime") if d.get("uTime") is not None else d.get("cTime"))
+
+        # комиссия
+        fee = d.get("fee")
+        commission = abs(self._to_float(fee)) if fee is not None else 0.0
+        fee_ccy = d.get("feeCcy") or "0"
+
+        # стоимость сделки в валюте расчёта (для OKX SPOT это quote)
+        value = fill_px * fill_sz
+        volume = value
+
+        return {
+            "id": str(trade_id),
+            "orderno": str(ord_id),
+            "comment": None,
+            "symbol": inst_id,
+            "side": side,
+            "price": fill_px,
+            "qtyUnits": fill_sz,     # float
+            "qty": fill_sz,          # float, "Количество" по Astras
+            "ts": ts_ms,
+            "commission": commission,
+            "feeCcy": fee_ccy,
+            "volume": volume,
+            "value": value,
+            "is_history": bool(is_history),
+        }
+
     #REST: активные заявки (pending)
     async def get_orders_pending(
         self,
@@ -574,6 +625,26 @@ class OkxAdapter:
         out: List[Dict[str, Any]] = []
         for item in raw.get("data", []):
             out.append(self._parse_okx_order_any(item))
+        return out
+
+    #REST: история сделок (fills-history) — исполнения за последние 3 месяца
+    async def get_trades_history(
+        self,
+        inst_type: str = "SPOT",
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает список исполнений в нейтральном формате.
+
+        OKX endpoint: /trade/fills-history
+        Возвращает историю за последние 3 месяца.
+        """
+        params: Dict[str, Any] = {"instType": inst_type, "limit": str(int(limit))}
+        raw = await self._request_private("GET", "/trade/fills-history", params=params)
+
+        out: List[Dict[str, Any]] = []
+        for item in raw.get("data", []):
+            out.append(self._parse_okx_trade_any(item, is_history=True))
         return out
 
     #WS: подписка на изменения заявок (private channel orders)
@@ -628,6 +699,83 @@ class OkxAdapter:
                         for item in data:
                             order = self._parse_okx_order_any(item)
                             res = on_data(order)
+                            if asyncio.iscoroutine(res):
+                                await res
+
+            except Exception:
+                await asyncio.sleep(1.0)
+                continue
+
+    #WS: подписка на сделки (исполнения) через private channel orders
+    async def subscribe_trades(
+        self,
+        on_data: Callable[[Dict[str, Any]], Any],
+        stop_event: asyncio.Event,
+        inst_type: str = "SPOT",
+    ) -> None:
+        """
+        Подписка на сделки (исполнения) OKX через приватный WS.
+
+        Используется private channel "orders": в сообщениях приходят fill-поля:
+        tradeId, fillPx, fillSz, fillTime, fee, feeCcy, ordId, instId, side.
+
+        Возвращает нейтральный формат для server.py (см. _parse_okx_trade_any).
+        Поле existing формируется в server.py, здесь есть флаг is_history=False.
+        """
+        login_msg = self._ws_login_payload()
+
+        sub_args: Dict[str, Any] = {"channel": "orders", "instType": inst_type}
+        sub_msg = {"op": "subscribe", "args": [sub_args]}
+
+        while not stop_event.is_set():
+            try:
+                async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
+                    await ws.send(json.dumps(login_msg))
+
+                    #ждём подтверждение login
+                    authed = False
+                    login_deadline = asyncio.get_event_loop().time() + 5.0
+                    while not authed and not stop_event.is_set():
+                        if asyncio.get_event_loop().time() > login_deadline:
+                            raise RuntimeError("OKX WS login timeout")
+
+                        raw = await ws.recv()
+                        msg = json.loads(raw)
+                        if msg.get("event") == "login":
+                            if msg.get("code") == "0":
+                                authed = True
+                                break
+                            raise RuntimeError(f"OKX WS login error: {msg}")
+
+                    await ws.send(json.dumps(sub_msg))
+
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        msg = json.loads(raw)
+                        if msg.get("event") == "error":
+                            return
+
+                        data = msg.get("data")
+                        if not data:
+                            continue
+
+                        for item in data:
+                            # сделка (исполнение) определяется наличием tradeId
+                            trade_id = item.get("tradeId")
+                            if not trade_id:
+                                continue
+
+                            # иногда приходит tradeId, но нет fillSz — отфильтруем пустые
+                            fill_sz = self._to_float(item.get("fillSz"))
+                            if fill_sz <= 0:
+                                continue
+
+                            trade = self._parse_okx_trade_any(item, is_history=False)
+                            res = on_data(trade)
                             if asyncio.iscoroutine(res):
                                 await res
 

@@ -9,7 +9,10 @@
 4. open_price в котировках нет, можно сделать pen24h в tickers (цена 24h назад)
 5. total_bid_vol, total_ask_vol пока 0. Строго можно посчитать сумму объёмов по тем уровням стакана, которые реально получаешь (например, depth=10/20/50). Это будет “сумма по полученной глубине”, а не “по всему стакану”, потому что полный стакан OKX не отдаёт. Если Astras ожидает именно “по всем уровням”, тогда строго это невозможно и надо ставить 0. 
 Если допускается “по стакану, который вы получаете по подписке” (как в OrderBookGetAndSubscribe), тогда считаем сумму по полученным уровням.
-6.  отдается за 24 часа "high_price": high_price, "low_price": low_price,
+6.  отдается за 24 часа "high_price": high_price, "low_price": low_price
+7. qtyUnits в сделках по портфелю вместо int отдается float
+8. все заявки/сделки по портфелю отдают все заявки/сделки по аккаунту, так как в okx нет портфелей. внутри аккаунта можно различать типы счетов (instType: SPOT / SWAP / FUTURES / OPTION)
+9. реализовываем только SPOT. FUTURES и SWAP можно добавить позже
 """
 
 
@@ -422,6 +425,7 @@ async def stream(ws: WebSocket):
                         symbols,
                         lambda ord_: asyncio.create_task(send_order_astras(ord_, False)),  # existing=False — новые события (private WS orders)
                         stop,
+                        inst_type="SPOT",
                     )
                 )
                 continue
@@ -616,29 +620,92 @@ async def stream(ws: WebSocket):
                     )
                 continue
 
-            # все сделки по портфелю
+            # все сделки по портфелю (Astras Simple)
             if opcode == "TradesGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["fills"].append(stop)
 
-                portfolio = msg.get("portfolio")
+                portfolio = msg.get("portfolio")  #адаптер игнорирует (в OKX нет такого понятия)
+                exchange_in = msg.get("exchange")  #адаптер игнорирует
+                data_format = msg.get("format")  #адаптер игнорирует
+
+                skip_history = bool(msg.get("skipHistory", False))
                 guid = msg.get("guid") or req_guid
-                _skip_history = msg.get("skipHistory", False)
 
-                async def on_fill_opcode(fill):
-                    await ws.send_json({
-                        "data": fill,
-                        "guid": guid
-                    })
+                exchange_out = "OKX"
 
-                asyncio.create_task(
-                    adapter.subscribe_fills(
-                        [portfolio] if portfolio else [],
-                        lambda f: asyncio.create_task(on_fill_opcode(f)),
-                        stop,
+                async def send_trade_astras(t: dict):
+                    ts_ms = int(t.get("ts", 0) or 0)
+                    date_iso = _iso_from_unix_ms(ts_ms) if ts_ms else None
+
+                    symbol = t.get("symbol") or "N/A"
+
+                    payload = {
+                        "id": str(t.get("id", "0")),
+                        "orderno": str(t.get("orderno", "0")),
+                        "comment": None,  # comment всегда null
+
+                        "symbol": symbol,
+                        "brokerSymbol": f"{exchange_out}:{symbol}",
+                        "exchange": exchange_out,
+
+                        "date": date_iso,
+                        "board": None,  # у OKX нет board
+
+                        # qtyUnits: float
+                        "qtyUnits": t.get("qtyUnits", 0) or 0,
+
+                        # qtyBatch: лотов у OKX нет
+                        "qtyBatch": 0,
+
+                        # qty: "Количество" по Astras -> используем qtyUnits (fill size), как float
+                        "qty": t.get("qty", 0) or 0,
+
+                        "price": t.get("price", 0) or 0,
+                        "accruedInt": 0,
+
+                        "side": t.get("side", "0") or "0",
+
+                        # existing: True для истории (snapshot), False для онлайна
+                        "existing": bool(t.get("is_history", False)),
+
+                        # комиссия: abs(fee) уже нормализована в адаптере
+                        "commission": t.get("commission", 0) or 0,
+
+                        "repoSpecificFields": None,
+
+                        # volume/value: price * qtyUnits (посчитано в адаптере)
+                        "volume": t.get("volume", 0) or 0,
+                        "value": t.get("value", 0) or 0,
+                    }
+
+                    await ws.send_json({"data": payload, "guid": guid})
+
+                # история (если skipHistory == false)
+                if not skip_history and hasattr(adapter, "get_trades_history"):
+                    try:
+                        history = await adapter.get_trades_history(inst_type="SPOT", limit=100)
+                        for tr in history:
+                            await send_trade_astras(tr)  # is_history=True -> existing=True
+                    except Exception:
+                        pass
+
+                # онлайн исполнения (private WS orders)
+                if hasattr(adapter, "subscribe_trades"):
+                    asyncio.create_task(
+                        adapter.subscribe_trades(
+                            on_data=lambda tr: asyncio.create_task(send_trade_astras(tr)),  # is_history=False -> existing=False
+                            stop_event=stop,
+                            inst_type="SPOT",
+                        )
                     )
-                )
+
                 continue
+            
+
+            # все сделки по инструменту
+            """if opcode == "AllTradesGetAndSubscribe":"""
+                # нужно добавить
 
             # все позиции портфеля
             if opcode == "PositionsGetAndSubscribeV2":
