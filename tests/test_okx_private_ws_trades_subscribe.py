@@ -26,7 +26,7 @@ async def test_okx_private_ws_trades_subscribe():
     """
     Проверяет, что:
     - private WS login проходит (event=login, code=0)
-    - подписка на канал исполнений (fills) проходит (event=subscribe)
+    - подписка на канал исполнений (fills) проходит, если доступно, иначе fallback на канал orders (должен быть доступен на обычных аккаунтах).
     Реальные сделки не нужны: подтверждение subscribe достаточно.
     """
 
@@ -64,22 +64,21 @@ async def test_okx_private_ws_trades_subscribe():
         assert msg.get("event") == "login"
         assert str(msg.get("code")) in ("0", 0), msg
 
-        # 2) subscribe to fills (исполнения/сделки)
+        # 2) try subscribe to fills (исполнения/сделки)
         await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "fills", "instType": "SPOT"}]}))
 
         msg = json.loads(await ws.recv())
-
-        # OKX может запрещать подписку на канал fills для аккаунтов ниже VIP6.
-        # Тогда приходит событие error с кодом 60029.
         if msg.get("event") == "error" and str(msg.get("code")) == "60029":
-            pytest.skip(
-                "OKX запретил подписку на private WS канал 'fills' (code=60029): "
-                "доступно только для VIP6+ по trading fee tier. "
-                "Для проверки 'сделок' на обычном аккаунте используйте REST fills-history "
-                "или private WS канал 'orders' (исполнения приходят в ордер-событиях)."
-            )
-
-        assert msg.get("event") == "subscribe", msg
-        arg = msg.get("arg") or {}
-        assert arg.get("channel") == "fills"
-        assert arg.get("instType") == "SPOT"
+            # fills недоступен на обычных аккаунтах (требуется VIP6+)
+            # fallback: подписываемся на orders
+            await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "orders", "instType": "SPOT"}]}))
+            msg2 = json.loads(await ws.recv())
+            assert msg2.get("event") == "subscribe", msg2
+            arg = msg2.get("arg") or {}
+            assert arg.get("channel") == "orders"
+            assert arg.get("instType") == "SPOT"
+        else:
+            assert msg.get("event") == "subscribe", msg
+            arg = msg.get("arg") or {}
+            assert arg.get("channel") == "fills"
+            assert arg.get("instType") == "SPOT"

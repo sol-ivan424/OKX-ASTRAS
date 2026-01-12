@@ -450,6 +450,8 @@ class OkxAdapter:
         split_adjust: bool,
         on_data: Callable[[dict], Any],
         stop_event: asyncio.Event,
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         channel = self._tf_to_okx_ws_channel(tf)
 
@@ -462,6 +464,7 @@ class OkxAdapter:
             try:
                 async with websockets.connect(self._ws_business_url, ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps(sub_msg))
+                    subscribed_sent = False
 
                     while not stop_event.is_set():
                         try:
@@ -471,7 +474,19 @@ class OkxAdapter:
 
                         msg = json.loads(raw)
 
+                        if msg.get("event") == "subscribe":
+                            if (not subscribed_sent) and on_subscribed is not None:
+                                res = on_subscribed(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            subscribed_sent = True
+                            continue
+
                         if msg.get("event") == "error":
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
                             return
 
                         data = msg.get("data")
@@ -654,6 +669,8 @@ class OkxAdapter:
         on_data: Callable[[Dict[str, Any]], Any],
         stop_event: asyncio.Event,
         inst_type: str = "SPOT",
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         login_msg = self._ws_login_payload()
 
@@ -681,6 +698,7 @@ class OkxAdapter:
                             raise RuntimeError(f"OKX WS login error: {msg}")
 
                     await ws.send(json.dumps(sub_msg))
+                    subscribed_sent = False
 
                     while not stop_event.is_set():
                         try:
@@ -689,7 +707,18 @@ class OkxAdapter:
                             continue
 
                         msg = json.loads(raw)
+                        if msg.get("event") == "subscribe":
+                            if (not subscribed_sent) and on_subscribed is not None:
+                                res = on_subscribed(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            subscribed_sent = True
+                            continue
                         if msg.get("event") == "error":
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
                             return
 
                         data = msg.get("data")
@@ -712,6 +741,8 @@ class OkxAdapter:
         on_data: Callable[[Dict[str, Any]], Any],
         stop_event: asyncio.Event,
         inst_type: str = "SPOT",
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         """
         Подписка на сделки (исполнения) OKX через приватный WS.
@@ -748,6 +779,7 @@ class OkxAdapter:
                             raise RuntimeError(f"OKX WS login error: {msg}")
 
                     await ws.send(json.dumps(sub_msg))
+                    subscribed_sent = False
 
                     while not stop_event.is_set():
                         try:
@@ -756,7 +788,18 @@ class OkxAdapter:
                             continue
 
                         msg = json.loads(raw)
+                        if msg.get("event") == "subscribe":
+                            if (not subscribed_sent) and on_subscribed is not None:
+                                res = on_subscribed(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            subscribed_sent = True
+                            continue
                         if msg.get("event") == "error":
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
                             return
 
                         data = msg.get("data")
@@ -790,6 +833,8 @@ class OkxAdapter:
         depth: int,
         on_data: Callable[[dict], Any],
         stop_event: asyncio.Event,
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         """
         Подписка на стакан OKX.
@@ -820,6 +865,7 @@ class OkxAdapter:
             try:
                 async with websockets.connect(self._ws_public_url, ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps(sub_msg))
+                    subscribed_sent = False
 
                     while not stop_event.is_set():
                         try:
@@ -829,7 +875,19 @@ class OkxAdapter:
 
                         msg = json.loads(raw)
 
+                        if msg.get("event") == "subscribe":
+                            if (not subscribed_sent) and on_subscribed is not None:
+                                res = on_subscribed(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            subscribed_sent = True
+                            continue
+
                         if msg.get("event") == "error":
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
                             return
 
                         action = (msg.get("action") or "").lower()
@@ -842,8 +900,6 @@ class OkxAdapter:
                         # OKX обычно присылает список с одним элементом
                         for item in data:
                             book = self._parse_okx_order_book_any(symbol, item, existing=is_snapshot)
-
-
                             res = on_data(book)
                             if asyncio.iscoroutine(res):
                                 await res
@@ -858,6 +914,8 @@ class OkxAdapter:
         symbol: str,
         on_data: Callable[[dict], Any],
         stop_event: asyncio.Event,
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         """
         Подписка на котировки OKX через WS tickers.
@@ -890,6 +948,7 @@ class OkxAdapter:
             try:
                 async with websockets.connect(self._ws_public_url, ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps(sub_msg))
+                    subscribed_sent = False
 
                     while not stop_event.is_set():
                         try:
@@ -899,7 +958,19 @@ class OkxAdapter:
 
                         msg = json.loads(raw)
 
+                        if msg.get("event") == "subscribe":
+                            if (not subscribed_sent) and on_subscribed is not None:
+                                res = on_subscribed(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            subscribed_sent = True
+                            continue
+
                         if msg.get("event") == "error":
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
                             return
 
                         data = msg.get("data")

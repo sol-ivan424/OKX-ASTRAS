@@ -13,6 +13,11 @@
 7. qtyUnits в сделках по портфелю вместо int отдается float
 8. все заявки/сделки по портфелю отдают все заявки/сделки по аккаунту, так как в okx нет портфелей. внутри аккаунта можно различать типы счетов (instType: SPOT / SWAP / FUTURES / OPTION)
 9. реализовываем только SPOT. FUTURES и SWAP можно добавить позже
+10. OKX рекомендует использовать For other users, please use WS / Order channel
+- к private WebSocket-каналу `fills` (исполнения/сделки) подписка разрешена только для аккаунтов с trading fee tier VIP6+ (ошибка `code=60029`).
+- На обычных аккаунтах real-time сделки через `fills` недоступны; для проверки/получения сделок используйте приватный REST (fills-history) либо private WS канал `orders`, где могут приходить события об исполнениях.
+11. соощение об ошибке в httpcode передаем реальный код okx
+
 """
 
 
@@ -291,6 +296,51 @@ async def stream(ws: WebSocket):
     async def send_wrapped(name: str, payload, guid: str | None = None):
         data = payload.dict() if hasattr(payload, "dict") else payload
         await ws.send_json({"data": data, "guid": guid or f"{name}:req"})
+    
+    #сообщение об успешной подписке. код 200
+    async def send_ack_200(guid: str | None):
+        await ws.send_json(
+            {
+                "message": "Handled successfully",
+                "httpCode": 200,
+                "requestGuid": guid,
+            }
+        )
+
+    # Astras сообщение: ошибка + закрыть WS
+    async def send_error_and_close(guid: str | None, http_code: int, message: str):
+        try:
+            await ws.send_json(
+                {
+                    "message": message,
+                    "httpCode": http_code,
+                    "requestGuid": guid,
+                }
+            )
+        finally:
+            await ws.close()
+    
+    # OKX -> Astras: передаём код ошибки OKX как есть.
+    def _okx_code_as_int(code):
+        try:
+            return int(code)
+        except Exception:
+            # если кода нет/не парсится - внутренняя ошибка
+            return 500
+
+    async def _handle_okx_ws_error(guid: str | None, ev: dict):
+        okx_code = ev.get("code")
+        okx_msg = ev.get("msg") or ev.get("message") or "OKX WS error"
+
+        http_code = _okx_code_as_int(okx_code)
+
+        # Формат Astras ошибки (requestGuid,httpCode,message)
+        # httpCode = реальный код OKX
+        await send_error_and_close(
+            guid,
+            http_code,
+            okx_msg,
+        )
 
     try:
         while True:
@@ -351,6 +401,63 @@ async def stream(ws: WebSocket):
                     })
 
                 if code:
+                    # --- 1) Сначала запускаем подписку и ждём подтверждение/ошибку от OKX ---
+                    subscribed_evt = asyncio.Event()
+                    error_evt = asyncio.Event()
+
+                    # Пока отправляем историю — онлайн бары складываем в буфер,
+                    # чтобы история шла строго ПОСЛЕ ACK(200) и ДО online-стрима.
+                    history_done = False
+                    live_buffer: list[dict] = []
+
+                    def _on_subscribed(_ev: dict):
+                        subscribed_evt.set()
+
+                    def _on_error(ev: dict):
+                        # OKX event:error -> Astras error (реальный code/msg) + close WS
+                        error_evt.set()
+                        return asyncio.create_task(_handle_okx_ws_error(guid, ev))
+
+                    async def _on_live_bar(b: dict):
+                        nonlocal history_done
+                        if not history_done:
+                            live_buffer.append(b)
+                            return
+                        await send_bar_astras(b)
+
+                    asyncio.create_task(
+                        adapter.subscribe_bars(
+                            symbol=code,
+                            tf=tf,
+                            from_ts=from_ts,
+                            skip_history=skip_history,
+                            split_adjust=split_adjust,
+                            on_data=lambda b: asyncio.create_task(_on_live_bar(b)),
+                            stop_event=stop,
+                            on_subscribed=_on_subscribed,
+                            on_error=_on_error,
+                        )
+                    )
+
+                    # Ждём либо subscribe, либо error (без таймаута, как договорились)
+                    done, pending = await asyncio.wait(
+                        [
+                            asyncio.create_task(subscribed_evt.wait()),
+                            asyncio.create_task(error_evt.wait()),
+                        ],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for t in pending:
+                        t.cancel()
+
+                    # Если была ошибка — _handle_okx_ws_error уже отправил ответ и закрыл WS
+                    if error_evt.is_set():
+                        return
+
+                    # --- 2) Подписка подтверждена -> отправляем ACK 200 ---
+                    await send_ack_200(guid)
+
+                    # --- 3) Потом история (если skipHistory=false) ---
                     if (not skip_history) and hasattr(adapter, "get_bars_history"):
                         try:
                             history = await adapter.get_bars_history(
@@ -363,17 +470,15 @@ async def stream(ws: WebSocket):
                         except Exception:
                             pass
 
-                    asyncio.create_task(
-                        adapter.subscribe_bars(
-                            symbol=code,
-                            tf=tf,
-                            from_ts=from_ts,
-                            skip_history=skip_history,
-                            split_adjust=split_adjust,
-                            on_data=lambda b: asyncio.create_task(send_bar_astras(b)),
-                            stop_event=stop,
-                        )
-                    )
+                    # --- 4) Теперь можно выпускать online-данные ---
+                    history_done = True
+
+                    # Сначала отдадим то, что успело прийти в live пока мы слали историю
+                    if live_buffer:
+                        for b in live_buffer:
+                            await send_bar_astras(b)
+                        live_buffer.clear()
+
                 continue
 
             # все заявки по портфелю (история + подписка) в Astras Simple
