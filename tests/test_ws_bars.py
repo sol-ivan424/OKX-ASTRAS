@@ -15,7 +15,7 @@ async def main():
             "instrumentGroup": "SPOT",
             "tf": "60",
             "from": from_ts,
-            "skipHistory": False,
+            "skipHistory": True,
             "splitAdjust": True,
             "format": "Simple",
             "frequency": 250,

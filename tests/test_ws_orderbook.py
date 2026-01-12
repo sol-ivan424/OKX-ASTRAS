@@ -250,7 +250,7 @@ if __name__ == "__main__":
         guid = "demo-orderbook"
         req = {
             "opcode": "OrderBookGetAndSubscribe",
-            "exchange": "MOEX",              # адаптер игнорирует
+            "exchange": "OKX",              # адаптер игнорирует
             "code": "BTC-USDT",              # OKX instId
             "instrumentGroup": "TQBR",       # адаптер игнорирует
             "depth": 10,
@@ -264,9 +264,9 @@ if __name__ == "__main__":
             await ws.send(json.dumps(req))
 
             # печатаем несколько сообщений: snapshot + пару update
-            for i in range(3):
+            for i in range(10):
                 msg = await _recv_one(ws, timeout_sec=30.0)
-                print(f"\n=== DEMO ORDERBOOK MESSAGE {i+1} ===")
+            
                 print(json.dumps(msg, indent=2, ensure_ascii=False))
 
     asyncio.run(_demo())
