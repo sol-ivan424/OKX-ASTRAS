@@ -687,15 +687,34 @@ class OkxAdapter:
                     login_deadline = asyncio.get_event_loop().time() + 5.0
                     while not authed and not stop_event.is_set():
                         if asyncio.get_event_loop().time() > login_deadline:
-                            raise RuntimeError("OKX WS login timeout")
+                            # пробрасываем ошибку наружу, чтобы server.py отправил Astras error envelope
+                            if on_error is not None:
+                                res = on_error({"event": "error", "code": None, "msg": "OKX WS login timeout"})
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
 
                         raw = await ws.recv()
                         msg = json.loads(raw)
+
+                        # OKX может прислать event:error вместо event:login
+                        if msg.get("event") == "error":
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
+
                         if msg.get("event") == "login":
                             if msg.get("code") == "0":
                                 authed = True
                                 break
-                            raise RuntimeError(f"OKX WS login error: {msg}")
+                            # ошибка логина — отдаём реальный code/msg
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
 
                     await ws.send(json.dumps(sub_msg))
                     subscribed_sent = False
@@ -731,9 +750,17 @@ class OkxAdapter:
                             if asyncio.iscoroutine(res):
                                 await res
 
-            except Exception:
+            except Exception as e:
+                # если произошла нештатная ошибка до подтверждения подписки — пробрасываем наружу
+                if on_error is not None:
+                    try:
+                        res = on_error({"event": "error", "code": None, "msg": f"OKX adapter error: {e}"})
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        pass
                 await asyncio.sleep(1.0)
-                continue
+                return
 
     #WS: подписка на сделки (исполнения) через private channel orders
     async def subscribe_trades(
@@ -768,15 +795,34 @@ class OkxAdapter:
                     login_deadline = asyncio.get_event_loop().time() + 5.0
                     while not authed and not stop_event.is_set():
                         if asyncio.get_event_loop().time() > login_deadline:
-                            raise RuntimeError("OKX WS login timeout")
+                            # пробрасываем ошибку наружу, чтобы server.py отправил Astras error envelope
+                            if on_error is not None:
+                                res = on_error({"event": "error", "code": None, "msg": "OKX WS login timeout"})
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
 
                         raw = await ws.recv()
                         msg = json.loads(raw)
+
+                        # OKX может прислать event:error вместо event:login
+                        if msg.get("event") == "error":
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
+
                         if msg.get("event") == "login":
                             if msg.get("code") == "0":
                                 authed = True
                                 break
-                            raise RuntimeError(f"OKX WS login error: {msg}")
+                            # ошибка логина — отдаём реальный code/msg
+                            if on_error is not None:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
 
                     await ws.send(json.dumps(sub_msg))
                     subscribed_sent = False
@@ -822,9 +868,17 @@ class OkxAdapter:
                             if asyncio.iscoroutine(res):
                                 await res
 
-            except Exception:
+            except Exception as e:
+                # если произошла нештатная ошибка до подтверждения подписки — пробрасываем наружу
+                if on_error is not None:
+                    try:
+                        res = on_error({"event": "error", "code": None, "msg": f"OKX adapter error: {e}"})
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        pass
                 await asyncio.sleep(1.0)
-                continue
+                return
 
     #WS: подписка на стакан (public channel books)
     async def subscribe_order_book(
