@@ -172,7 +172,10 @@ async def hyperion(request: Request):
 
     # Быстро "попробовать" обновить кеши (с TTL + timeout внутри)
     await _ensure_instr_cache()
-    await _ensure_quote_cache()
+    # Всегда свежие котировки для Hyperion
+    tickers = await adapter.list_tickers(inst_type="SPOT")
+    ticker_map = {t["symbol"]: t for t in tickers if t.get("symbol")}
+
 
     items = list(_INSTR_CACHE.values())
 
@@ -187,6 +190,22 @@ async def hyperion(request: Request):
         items = [x for x in items if q in str(x.get("symbol", "")).upper()]
 
     total_count = len(items)
+
+
+        # --- сортировка (Astras передаёт variables.order) ---
+    order_spec = variables.get("order") or []
+
+    sort_dir = None
+    for o in order_spec:
+        bi = (o or {}).get("basicInformation") or {}
+        sym_dir = bi.get("symbol")
+        if sym_dir in ("ASC", "DESC"):
+            sort_dir = sym_dir
+            break
+
+    if sort_dir:
+        rev = (sort_dir == "DESC")
+        items.sort(key=lambda x: str(x.get("symbol") or ""), reverse=rev)
 
     # --- пагинация по after (cursor = индекс) ---
     start_idx = 0
@@ -211,15 +230,23 @@ async def hyperion(request: Request):
         inst_type = raw.get("instType") or "SPOT"
         quote_ccy = raw.get("quoteCcy")
 
-        q = _get_quote(symbol)
+        # Котировки строго по symbol из REST tickers (okx_adapter.list_tickers)
+        t = ticker_map.get(symbol, {})
 
-        last_price = q.get("last_price")
-        high_price = q.get("high_price")
-        low_price = q.get("low_price")
-        open_price = q.get("open_price")
-        volume = q.get("volume")
-        change = q.get("change")
-        change_percent = q.get("change_percent")
+        last = t.get("last")
+        open24h = t.get("open24h")
+        high24h = t.get("high24h")
+        low24h = t.get("low24h")
+        vol24h = t.get("vol24h")
+
+        # Рост за день считаем от open24h (цена 24 часа назад)
+        if open24h is not None and open24h != 0 and last is not None:
+            daily_growth = last - open24h
+            daily_growth_percent = (daily_growth / open24h) * 100.0
+        else:
+            daily_growth = None
+            daily_growth_percent = None
+
 
         return {
             "__typename": "InstrumentModel",
@@ -242,24 +269,27 @@ async def hyperion(request: Request):
             "tradingDetails": {
                 "__typename": "InstrumentTradingDetails",
 
-                # цены/шаги из instruments + подмешиваем котировки строго по symbol
+                # цены / шаги — из instruments
                 "minStep": raw.get("tickSz"),
                 "priceStep": raw.get("tickSz"),
                 "lotSize": raw.get("lotSz"),
 
-                "price": last_price if last_price is not None else raw.get("price"),
-                "priceMax": high_price if high_price is not None else raw.get("priceMax"),
-                "priceMin": low_price if low_price is not None else raw.get("priceMin"),
+                # котировки — из REST tickers (строго по symbol)
+                "price": last if last is not None else None,
+                "priceMax": high24h if high24h is not None else None,
+                "priceMin": low24h if low24h is not None else None,
 
-                # рост/объем — из котировок (если не успели получить → null)
-                "dailyGrowth": change,
-                "dailyGrowthPercent": change_percent,
-                "tradeVolume": volume,
+                # рост за день
+                "dailyGrowth": daily_growth,
+                "dailyGrowthPercent": daily_growth_percent,
+
+                # объёмы (24h, базовая валюта)
+                "tradeVolume": vol24h,
                 "tradeAmount": None,
 
-                # остальное можно оставлять null (Astras допускает)
+                # остальное Astras допускает как null
                 "capitalization": None,
-                "closingPrice": last_price if last_price is not None else None,
+                "closingPrice": last if last is not None else None,
                 "rating": None,
             },
             "financialAttributes": {
@@ -520,21 +550,15 @@ from typing import Optional
 
 _INSTR_CACHE: dict[str, dict] = {}
 # Ключ: symbol (например, BTC-USDT)
-# Кеш последних котировок по symbol (ИСТОЧНИК: REST tickers OKX)
-_QUOTE_CACHE: dict[str, dict] = {}
 
 # Чтобы не дергать OKX на каждый GraphQL запрос (Astras шлет их пачкой)
 _INSTR_CACHE_TS: float = 0.0
-_QUOTE_CACHE_TS: float = 0.0
 _INSTR_LOCK = asyncio.Lock()
-_QUOTE_LOCK = asyncio.Lock()
+
 
 # TTL кешей (сек)
-_INSTR_TTL_SEC = 60.0   # инструменты редко меняются
-_QUOTE_TTL_SEC = 3.0    # котировки можно чаще
+_INSTR_TTL_SEC = 60.0
 
-def _get_quote(symbol: str) -> dict:
-    return _QUOTE_CACHE.get(symbol, {})
 
 async def _refresh_instr_cache():
     global _INSTR_CACHE, _INSTR_CACHE_TS
@@ -542,48 +566,6 @@ async def _refresh_instr_cache():
     _INSTR_CACHE = {x.get("symbol"): x for x in (raw or []) if x.get("symbol")}
     _INSTR_CACHE_TS = time.time()
 
-async def _refresh_quote_cache_from_rest():
-    global _QUOTE_CACHE, _QUOTE_CACHE_TS
-    raw = await adapter.list_tickers(inst_type="SPOT")
-
-    new_cache: dict[str, dict] = {}
-
-    for t in (raw or []):
-        symbol = t.get("symbol")
-        if not symbol:
-            continue
-
-        def _to_float(v):
-            try:
-                return float(v)
-            except Exception:
-                return None
-
-        last_price = _to_float(t.get("last"))
-        open_price = _to_float(t.get("open24h"))
-        high24h = _to_float(t.get("high24h"))
-        low24h = _to_float(t.get("low24h"))
-        vol24h = _to_float(t.get("vol24h"))
-
-        if open_price and last_price is not None:
-            change = last_price - open_price
-            change_percent = (change / open_price) * 100.0
-        else:
-            change = None
-            change_percent = None
-
-        new_cache[symbol] = {
-            "last_price": last_price,
-            "high_price": high24h,
-            "low_price": low24h,
-            "open_price": open_price,
-            "volume": vol24h,
-            "change": change,
-            "change_percent": change_percent,
-        }
-
-    _QUOTE_CACHE = new_cache
-    _QUOTE_CACHE_TS = time.time()
 
 async def _ensure_instr_cache():
     if _INSTR_CACHE and (time.time() - _INSTR_CACHE_TS) < _INSTR_TTL_SEC:
@@ -598,18 +580,6 @@ async def _ensure_instr_cache():
         except Exception:
             return
 
-async def _ensure_quote_cache():
-    if _QUOTE_CACHE and (time.time() - _QUOTE_CACHE_TS) < _QUOTE_TTL_SEC:
-        return
-
-    async with _QUOTE_LOCK:
-        if _QUOTE_CACHE and (time.time() - _QUOTE_CACHE_TS) < _QUOTE_TTL_SEC:
-            return
-        # не висим на OKX
-        try:
-            await asyncio.wait_for(_refresh_quote_cache_from_rest(), timeout=3.0)
-        except Exception:
-            return
 
 async def _get_instr(symbol: str) -> Optional[dict]:
     if not _INSTR_CACHE:
