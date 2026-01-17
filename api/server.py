@@ -18,6 +18,9 @@
 - На обычных аккаунтах real-time сделки через `fills` недоступны; для проверки/получения сделок используйте приватный REST (fills-history) либо private WS канал `orders`, где могут приходить события об исполнениях.
 11. соощение об ошибке в httpcode передаем реальный код okx
 
+
+1. нужно ли делать возмоность множественных одинаковых подписок?
+2. 389, 474, 453, 122, 447, 400, 429 строка - костыль
 """
 
 
@@ -107,6 +110,15 @@ def user_settings_write(
     USER_SETTINGS[key or ""] = value
     return {"ok": True}
 
+@app.delete("/identity/v5/UserSettings")
+def user_settings_delete(
+    serviceName: str = Query(default="Astras"),
+    key: str | None = None,
+):
+    if key is not None:
+        USER_SETTINGS.pop(key, None)
+    return {"ok": True}
+
 @app.post("/identity/v5/UserSettings/group/widget-settings")
 @app.put("/identity/v5/UserSettings/group/widget-settings")
 def widget_settings_write(payload: dict = Body(default={})):
@@ -138,10 +150,157 @@ def list_subscriptions():
 from fastapi import Request
 
 @app.post("/hyperion")
-async def hyperion_stub(request: Request):
-    # UI шлёт GraphQL. Пока возвращаем пустой ответ.
-    return JSONResponse({"data": {}})
+async def hyperion(request: Request):
+    """
+    GraphQL endpoint для Astras (виджет «Все инструменты»).
 
+    Главная цель: НЕ ловить 504.
+    Поэтому здесь нельзя синхронно ждать OKX REST бесконечно.
+    """
+    body = await request.json()
+    variables = body.get("variables", {}) or {}
+    where = variables.get("where") or {}
+
+    first = variables.get("first", 20)
+    try:
+        first = int(first)
+    except Exception:
+        first = 20
+    first = max(1, min(first, 500))
+
+    after = variables.get("after")
+
+    # Быстро "попробовать" обновить кеши (с TTL + timeout внутри)
+    await _ensure_instr_cache()
+    await _ensure_quote_cache()
+
+    items = list(_INSTR_CACHE.values())
+
+    # --- поиск по symbol.contains ---
+    symbol_contains = (
+        (where.get("basicInformation") or {})
+        .get("symbol", {})
+        .get("contains")
+    )
+    if symbol_contains:
+        q = str(symbol_contains).upper()
+        items = [x for x in items if q in str(x.get("symbol", "")).upper()]
+
+    total_count = len(items)
+
+    # --- пагинация по after (cursor = индекс) ---
+    start_idx = 0
+    if after:
+        try:
+            start_idx = int(after)
+        except Exception:
+            start_idx = 0
+    start_idx = max(0, min(start_idx, total_count))
+
+    sliced = items[start_idx:start_idx + first]
+    end_idx = start_idx + len(sliced)
+
+    has_next = end_idx < total_count
+    has_prev = start_idx > 0
+
+    start_cursor = str(start_idx) if total_count > 0 else None
+    end_cursor = str(end_idx) if total_count > 0 else None
+
+    def _make_node(raw: dict) -> dict:
+        symbol = raw.get("symbol")
+        inst_type = raw.get("instType") or "SPOT"
+        quote_ccy = raw.get("quoteCcy")
+
+        q = _get_quote(symbol)
+
+        last_price = q.get("last_price")
+        high_price = q.get("high_price")
+        low_price = q.get("low_price")
+        open_price = q.get("open_price")
+        volume = q.get("volume")
+        change = q.get("change")
+        change_percent = q.get("change_percent")
+
+        return {
+            "__typename": "InstrumentModel",
+            "basicInformation": {
+                "__typename": "InstrumentBasicInformation",
+                "symbol": symbol,
+                "exchange": "OKX",
+                "shortName": symbol,
+                "market": inst_type,
+                "gicsSector": None,
+            },
+            "currencyInformation": {
+                "__typename": "InstrumentCurrencyInformation",
+                "nominal": quote_ccy,
+            },
+            "boardInformation": {
+                "__typename": "InstrumentBoardInformation",
+                "board": inst_type,
+            },
+            "tradingDetails": {
+                "__typename": "InstrumentTradingDetails",
+
+                # цены/шаги из instruments + подмешиваем котировки строго по symbol
+                "minStep": raw.get("tickSz"),
+                "priceStep": raw.get("tickSz"),
+                "lotSize": raw.get("lotSz"),
+
+                "price": last_price if last_price is not None else raw.get("price"),
+                "priceMax": high_price if high_price is not None else raw.get("priceMax"),
+                "priceMin": low_price if low_price is not None else raw.get("priceMin"),
+
+                # рост/объем — из котировок (если не успели получить → null)
+                "dailyGrowth": change,
+                "dailyGrowthPercent": change_percent,
+                "tradeVolume": volume,
+                "tradeAmount": None,
+
+                # остальное можно оставлять null (Astras допускает)
+                "capitalization": None,
+                "closingPrice": last_price if last_price is not None else None,
+                "rating": None,
+            },
+            "financialAttributes": {
+                "__typename": "InstrumentFinancialAttributes",
+                "cfiCode": raw.get("cfiCode"),
+                "currency": quote_ccy,
+                "isin": raw.get("ISIN"),
+                "tradingStatus": raw.get("tradingStatus"),
+                "tradingStatusInfo": raw.get("state"),
+            },
+        }
+
+    nodes = [_make_node(x) for x in sliced]
+
+    edges = []
+    for i, n in enumerate(nodes):
+        edges.append({
+            "__typename": "InstrumentModelEdge",
+            "cursor": str(start_idx + i + 1),
+            "node": n,
+        })
+
+    page_info = {
+        "__typename": "PageInfo",
+        "startCursor": start_cursor,
+        "endCursor": end_cursor,
+        "hasNextPage": has_next,
+        "hasPreviousPage": has_prev,
+    }
+
+    return JSONResponse({
+        "data": {
+            "instruments": {
+                "__typename": "InstrumentModelConnection",
+                "nodes": nodes,
+                "totalCount": total_count,
+                "edges": edges,
+                "pageInfo": page_info,
+            }
+        }
+    })
 
 # FOR ASTRAS
 
@@ -360,11 +519,97 @@ def _astras_order_simple_from_okx_neutral(
 from typing import Optional
 
 _INSTR_CACHE: dict[str, dict] = {}
+# Ключ: symbol (например, BTC-USDT)
+# Кеш последних котировок по symbol (ИСТОЧНИК: REST tickers OKX)
+_QUOTE_CACHE: dict[str, dict] = {}
+
+# Чтобы не дергать OKX на каждый GraphQL запрос (Astras шлет их пачкой)
+_INSTR_CACHE_TS: float = 0.0
+_QUOTE_CACHE_TS: float = 0.0
+_INSTR_LOCK = asyncio.Lock()
+_QUOTE_LOCK = asyncio.Lock()
+
+# TTL кешей (сек)
+_INSTR_TTL_SEC = 60.0   # инструменты редко меняются
+_QUOTE_TTL_SEC = 3.0    # котировки можно чаще
+
+def _get_quote(symbol: str) -> dict:
+    return _QUOTE_CACHE.get(symbol, {})
 
 async def _refresh_instr_cache():
-    global _INSTR_CACHE
+    global _INSTR_CACHE, _INSTR_CACHE_TS
     raw = await adapter.list_instruments()
-    _INSTR_CACHE = {x.get("symbol"): x for x in raw if x.get("symbol")}
+    _INSTR_CACHE = {x.get("symbol"): x for x in (raw or []) if x.get("symbol")}
+    _INSTR_CACHE_TS = time.time()
+
+async def _refresh_quote_cache_from_rest():
+    global _QUOTE_CACHE, _QUOTE_CACHE_TS
+    raw = await adapter.list_tickers(inst_type="SPOT")
+
+    new_cache: dict[str, dict] = {}
+
+    for t in (raw or []):
+        symbol = t.get("symbol")
+        if not symbol:
+            continue
+
+        def _to_float(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        last_price = _to_float(t.get("last"))
+        open_price = _to_float(t.get("open24h"))
+        high24h = _to_float(t.get("high24h"))
+        low24h = _to_float(t.get("low24h"))
+        vol24h = _to_float(t.get("vol24h"))
+
+        if open_price and last_price is not None:
+            change = last_price - open_price
+            change_percent = (change / open_price) * 100.0
+        else:
+            change = None
+            change_percent = None
+
+        new_cache[symbol] = {
+            "last_price": last_price,
+            "high_price": high24h,
+            "low_price": low24h,
+            "open_price": open_price,
+            "volume": vol24h,
+            "change": change,
+            "change_percent": change_percent,
+        }
+
+    _QUOTE_CACHE = new_cache
+    _QUOTE_CACHE_TS = time.time()
+
+async def _ensure_instr_cache():
+    if _INSTR_CACHE and (time.time() - _INSTR_CACHE_TS) < _INSTR_TTL_SEC:
+        return
+
+    async with _INSTR_LOCK:
+        if _INSTR_CACHE and (time.time() - _INSTR_CACHE_TS) < _INSTR_TTL_SEC:
+            return
+        # не висим на OKX
+        try:
+            await asyncio.wait_for(_refresh_instr_cache(), timeout=3.0)
+        except Exception:
+            return
+
+async def _ensure_quote_cache():
+    if _QUOTE_CACHE and (time.time() - _QUOTE_CACHE_TS) < _QUOTE_TTL_SEC:
+        return
+
+    async with _QUOTE_LOCK:
+        if _QUOTE_CACHE and (time.time() - _QUOTE_CACHE_TS) < _QUOTE_TTL_SEC:
+            return
+        # не висим на OKX
+        try:
+            await asyncio.wait_for(_refresh_quote_cache_from_rest(), timeout=3.0)
+        except Exception:
+            return
 
 async def _get_instr(symbol: str) -> Optional[dict]:
     if not _INSTR_CACHE:
@@ -447,13 +692,7 @@ async def md_security_available_boards(
 
 @app.get("/md/v2/boards")
 def md_boards():
-    return JSONResponse([
-        {
-            "exchange": "OKX",
-            "board": "SPOT",
-            "market": "SPOT"
-        }
-    ])
+    return JSONResponse(["SPOT"])
 
 @app.get("/instruments/v1/TreeMap")
 async def instruments_treemap(market: str | None = None, limit: int = 50):
@@ -556,6 +795,36 @@ async def md_history(
 def md_quotes_stub(broker_symbol: str):
     return JSONResponse([])
 
+@app.get("/md/v2/Securities")
+async def md_securities_root(
+    exchange: str | None = None,
+    query: str | None = None,
+    limit: int = 200,
+    instrumentGroup: str | None = None,
+):
+    if not _INSTR_CACHE:
+        await _refresh_instr_cache()
+
+    items = list(_INSTR_CACHE.values())
+
+    if query:
+        q = query.upper()
+        items = [x for x in items if q in x.get("symbol", "").upper()]
+
+    items = items[: max(1, min(limit, 1000))]
+
+    out = []
+    for raw in items:
+        x = _astras_instrument_simple(raw)
+
+        if instrumentGroup:
+            x["board"] = instrumentGroup
+            x["primary_board"] = instrumentGroup
+
+        out.append(x)
+
+    return JSONResponse(out)
+
 # FOR ASTRAS
 
 @app.get("/md/v2/time")
@@ -575,17 +844,23 @@ async def get_instruments(exchange: str = "OKX", format: str = "Simple", token: 
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
-    await ws.accept()
+    try:
+        await ws.accept()
+    except Exception:
+        return
 
-# FOR ASTRAS
+    async def safe_send_json(payload: dict):
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            return
 
-# 1. Service-ACK (обязательно)
-    await ws.send_json({
+    await safe_send_json({
         "message": "Connected",
         "httpCode": 200,
     })
-
-# FOR ASTRAS
 
     active: dict[str, list[asyncio.Event]] = {
         "instruments": [],   # пока не используются в opcode
@@ -600,6 +875,10 @@ async def stream(ws: WebSocket):
     
     # guid -> stop_event (чтобы уметь корректно отписываться)
     subs: dict[str, asyncio.Event] = {}
+
+    # throttling per subscription guid (frequency in ms)
+    last_sent_ms_book: dict[str, int] = {}
+    last_sent_ms_quotes: dict[str, int] = {}
 
     async def send_wrapped(name: str, payload, guid: str | None = None):
         data = payload.dict() if hasattr(payload, "dict") else payload
@@ -627,16 +906,6 @@ async def stream(ws: WebSocket):
             )
         finally:
             await ws.close()
-    
-    async def safe_send_json(payload: dict):
-        # не шлём, если сокет уже закрыт/закрывается
-        if ws.client_state != WebSocketState.CONNECTED:
-            return
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            # сокет мог закрыться между проверкой и send
-            return
         
     # OKX -> Astras: передаём код ошибки OKX как есть.
     def _okx_code_as_int(code):
@@ -662,7 +931,14 @@ async def stream(ws: WebSocket):
 
     try:
         while True:
-            msg = await ws.receive_json()
+
+            try:
+                msg = await ws.receive_json()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+            except Exception:
+                break
+
             opcode = msg.get("opcode")
             token = msg.get("token")
             symbols: List[str] = msg.get("symbols", [])
@@ -683,6 +959,10 @@ async def stream(ws: WebSocket):
                 ev = subs.pop(unsub_guid, None)
                 if ev:
                     ev.set()
+
+                # чистим throttling по guid, чтобы не копился мусор
+                last_sent_ms_book.pop(unsub_guid, None)
+                last_sent_ms_quotes.pop(unsub_guid, None)
 
                 await safe_send_json({
                     "message": "Handled successfully",
@@ -705,23 +985,30 @@ async def stream(ws: WebSocket):
 
             # свечи (история + подписка). присылаются и открытые и закрытые свечи (confirm == 0,1)
             if opcode == "BarsGetAndSubscribe":
+                # Astras может переиспользовать один и тот же guid при смене инструмента в том же виджете.
+                # Поэтому если такой guid уже есть — останавливаем старую подписку и запускаем новую.
+                sub_guid = msg.get("guid") or req_guid
+
+                old = subs.pop(sub_guid, None)
+                if old:
+                    old.set()
+
                 stop = asyncio.Event()
                 active["bars"].append(stop)
+                subs[sub_guid] = stop
 
                 code = msg.get("code")
                 tf = str(msg.get("tf", "60"))
                 from_ts = int(msg.get("from", int(time.time())))
                 skip_history = bool(msg.get("skipHistory", False))
                 split_adjust = bool(msg.get("splitAdjust", True))  #адаптер игнорирует
-                sub_guid = msg.get("guid") or req_guid
-                subs[sub_guid] = stop
 
                 exchange = msg.get("exchange")  #адаптер игнорирует
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
                 data_format = msg.get("format")  #адаптер игнорирует
                 frequency = msg.get("frequency")  #адаптер игнорирует
 
-                async def send_bar_astras(bar: dict, _guid=sub_guid):
+                async def send_bar_astras(bar: dict, _guid: str):
                     o = bar.get("open")
                     h = bar.get("high")
                     l = bar.get("low")
@@ -771,12 +1058,12 @@ async def stream(ws: WebSocket):
                         error_evt.set()
                         return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
-                    async def _on_live_bar(b: dict):
+                    async def _on_live_bar(b: dict, _guid: str):
                         nonlocal history_done
                         if not history_done:
                             live_buffer.append(b)
                             return
-                        await send_bar_astras(b)
+                        await send_bar_astras(b, _guid)
 
                     asyncio.create_task(
                         adapter.subscribe_bars(
@@ -785,7 +1072,7 @@ async def stream(ws: WebSocket):
                             from_ts=from_ts,
                             skip_history=skip_history,
                             split_adjust=split_adjust,
-                            on_data=lambda b: asyncio.create_task(_on_live_bar(b)),
+                            on_data=lambda b, _g=sub_guid: asyncio.create_task(_on_live_bar(b, _g)),
                             stop_event=stop,
                             on_subscribed=_on_subscribed,
                             on_error=_on_error,
@@ -823,7 +1110,7 @@ async def stream(ws: WebSocket):
                             history.sort(key=lambda x: int(x.get("ts", 0)))
 
                             for hbar in history:
-                                await send_bar_astras(hbar)
+                                await send_bar_astras(hbar, sub_guid)
                         except Exception:
                             pass
 
@@ -833,10 +1120,11 @@ async def stream(ws: WebSocket):
                     # Сначала отдадим то, что успело прийти буфер
                     if live_buffer:
                         for b in live_buffer:
-                            await send_bar_astras(b)
+                            await send_bar_astras(b, sub_guid)
                         live_buffer.clear()
 
                 continue
+
 
             # все заявки по портфелю (история + подписка) в Astras Simple
             if opcode == "OrdersGetAndSubscribeV2":
@@ -849,6 +1137,13 @@ async def stream(ws: WebSocket):
                 statuses = msg.get("orderStatuses") or []
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
+
+                # Если Astras переиспользовал guid (например, при смене инструмента в том же виджете)
+                # — останавливаем старую подписку с этим guid и запускаем новую.
+                old = subs.pop(sub_guid, None)
+                if old:
+                    old.set()
+
                 subs[sub_guid] = stop
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
                 data_format = msg.get("format")  #адаптер игнорирует
@@ -890,17 +1185,17 @@ async def stream(ws: WebSocket):
                     error_evt.set()
                     return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
-                async def _on_live_order(o: dict):
+                async def _on_live_order(o: dict, _guid: str):
                     nonlocal history_done
                     if not history_done:
                         live_buffer.append(o)
                         return
-                    await send_order_astras(o, False)  # existing=False — новые события (private WS orders)
+                    await send_order_astras(o, False, _guid)  # existing=False — новые события (private WS orders)
 
                 asyncio.create_task(
                     adapter.subscribe_orders(
                         symbols,
-                        lambda ord_: asyncio.create_task(_on_live_order(ord_)),
+                        lambda ord_, _g=sub_guid: asyncio.create_task(_on_live_order(ord_, _g)),
                         stop,
                         inst_type="SPOT",
                         on_subscribed=_on_subscribed,
@@ -935,7 +1230,7 @@ async def stream(ws: WebSocket):
                             inst_id=inst_id,
                         )
                         for ho in history_orders:
-                            await send_order_astras(ho, True)  # existing=True — данные из снепшота/истории (pending REST)
+                            await send_order_astras(ho, True, sub_guid)  # existing=True — данные из снепшота/истории (pending REST)
                     except Exception:
                         pass
 
@@ -945,7 +1240,7 @@ async def stream(ws: WebSocket):
                 # Сначала то, что успело прийти в буфер
                 if live_buffer:
                     for o in live_buffer:
-                        await send_order_astras(o, False)
+                        await send_order_astras(o, False, sub_guid)
                     live_buffer.clear()
 
                 continue
@@ -957,35 +1252,36 @@ async def stream(ws: WebSocket):
 
                 code = msg.get("code")
                 depth = int(msg.get("depth", 20) or 20)
-                code = msg.get("code")
-                depth = int(msg.get("depth", 20) or 20)
 
                 frequency = msg.get("frequency")
                 try:
                     frequency = int(frequency) if frequency is not None else 25
                 except Exception:
                     frequency = 25
-                frequency = int(frequency) if isinstance(frequency, (int, float, str)) and str(frequency).strip() != "" else 25
-                
+
                 sub_guid = msg.get("guid") or req_guid
+
+                # если Astras переиспользовал guid — остановим старую подписку с этим guid
+                old = subs.pop(sub_guid, None)
+                if old:
+                    old.set()
+
                 subs[sub_guid] = stop
+
                 # эти поля Astras сейчас не влияют на OKX (оставляем как есть)
                 exchange = msg.get("exchange")  #адаптер игнорирует
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
                 data_format = msg.get("format")  #адаптер игнорирует
 
-                # троттлинг: Astras просит отдавать не чаще, чем раз в frequency мс
-                last_sent_ms = 0
-
-                async def on_book(book: dict, _guid=sub_guid):
-                    nonlocal last_sent_ms
-
+                async def on_book(book: dict, _guid: str):
                     now_ms = int(time.time() * 1000)
                     freq_ms = frequency if isinstance(frequency, int) else 25
-                    if freq_ms > 0 and (now_ms - last_sent_ms) < freq_ms:
+
+                    prev_ms = last_sent_ms_book.get(_guid, 0)
+                    if freq_ms > 0 and (now_ms - prev_ms) < freq_ms:
                         return
 
-                    last_sent_ms = now_ms
+                    last_sent_ms_book[_guid] = now_ms
 
                     """" 
                     book (нейтральный формат от адаптера):
@@ -1010,8 +1306,8 @@ async def stream(ws: WebSocket):
                         bids_in = bids_in[:depth]
                         asks_in = asks_in[:depth]
 
-                    bids = [{"price": float(p), "volume": float(v)} for (p, v) in bids_in]
-                    asks = [{"price": float(p), "volume": float(v)} for (p, v) in asks_in]
+                    bids = [{"price": p, "volume": v} for (p, v) in bids_in]
+                    asks = [{"price": p, "volume": v} for (p, v) in asks_in]
 
                     payload = {
                         # snapshot и timestamp устаревшие
@@ -1043,18 +1339,18 @@ async def stream(ws: WebSocket):
                         error_evt.set()
                         return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
-                    async def _on_live_book(b: dict):
+                    async def _on_live_book(b: dict, _guid: str):
                         nonlocal history_done
                         if not history_done:
                             live_buffer.append(b)
                             return
-                        await on_book(b)
+                        await on_book(b, _guid)
 
                     asyncio.create_task(
                         adapter.subscribe_order_book(
                             symbol=code,
                             depth=depth,
-                            on_data=lambda b: asyncio.create_task(_on_live_book(b)),
+                            on_data=lambda b, _g=sub_guid: asyncio.create_task(_on_live_book(b, _g)),
                             stop_event=stop,
                             on_subscribed=_on_subscribed,
                             on_error=_on_error,
@@ -1085,7 +1381,7 @@ async def stream(ws: WebSocket):
                     # Сначала то, что успело прийти в буфер
                     if live_buffer:
                         for b in live_buffer:
-                            await on_book(b)
+                            await on_book(b, sub_guid)
                         live_buffer.clear()
 
                 continue
@@ -1104,43 +1400,32 @@ async def stream(ws: WebSocket):
                     frequency = int(frequency) if frequency is not None else 25
                 except Exception:
                     frequency = 25
-                frequency = int(frequency) if isinstance(frequency, (int, float, str)) and str(frequency).strip() != "" else 25
 
                 sub_guid = msg.get("guid") or req_guid
+                # если Astras переиспользовал guid — остановим старую подписку с этим guid
+                old = subs.pop(sub_guid, None)
+                if old:
+                    old.set()
+
                 subs[sub_guid] = stop
                 exchange_out = "OKX"
 
                 symbol = code or (symbols[0] if symbols else "")
 
-                # троттлинг: не отправлять чаще, чем раз в frequency мс
-                last_sent_ms = 0
-
-                async def send_quote_astras(t: dict, _guid=sub_guid):
-                    nonlocal last_sent_ms
-
+                async def send_quote_astras(t: dict, _guid: str):
                     now_ms = int(time.time() * 1000)
                     freq_ms = frequency if isinstance(frequency, int) else 25
-                    if freq_ms > 0 and (now_ms - last_sent_ms) < freq_ms:
+
+                    prev_ms = last_sent_ms_quotes.get(_guid, 0)
+                    if freq_ms > 0 and (now_ms - prev_ms) < freq_ms:
                         return
 
-                    # t (нейтральный формат от адаптера subscribe_quotes):
-                    # {
-                    #   "symbol": "...",
-                    #   "ts": <ms>,
-                    #   "last": <float>,
-                    #   "bid": <float>,
-                    #   "ask": <float>,
-                    #   "bid_sz": <float>,
-                    #   "ask_sz": <float>,
-                    #   "high24h": <float>,
-                    #   "low24h": <float>,
-                    #   "vol24h": <float>
-                    # }
+                    last_sent_ms_quotes[_guid] = now_ms
 
                     ts_ms = int(t.get("ts", 0) or 0)
                     ts_sec = int(ts_ms / 1000) if ts_ms else 0
 
-                    last_price = t.get("last", 0) or 0
+                    last_price = t.get("last", 0)
                     bid = t.get("bid", 0) or 0
                     ask = t.get("ask", 0) or 0
 
@@ -1149,16 +1434,25 @@ async def stream(ws: WebSocket):
 
                     high_price = t.get("high24h", 0) or 0
                     low_price = t.get("low24h", 0) or 0
-
+                    open_price = t.get("open24h", 0) or 0
                     # volume: в базовой валюте (OKX vol24h). Если OKX отдаёт дробь — отдаём дробь.
                     volume = t.get("vol24h", 0) or 0
+
+                    # change / change_percent считаем строго от open24h (цена 24 часа назад).
+
+                    if open_price > 0:
+                        change = last_price - open_price
+                        change_percent = (change / open_price) * 100.0
+                    else:
+                        change = 0.0
+                        change_percent = 0.0
 
                     payload = {
                         "symbol": symbol,
                         "exchange": exchange_out,
                         "description": None,
 
-                        "prev_close_price": None,
+                        "prev_close_price": open_price,
 
                         "last_price": last_price,
                         "last_price_timestamp": ts_sec,
@@ -1180,7 +1474,7 @@ async def stream(ws: WebSocket):
 
                         "ob_ms_timestamp": None,
 
-                        "open_price": 0,
+                        "open_price": open_price,  # цена 24 часа назад (OKX open24h)
                         "yield": None,
 
                         "lotsize": 0,
@@ -1194,8 +1488,8 @@ async def stream(ws: WebSocket):
                         "accrued_interest": 0,
 
                         # change/change_percent зависят от prev_close_price; при null -> 0
-                        "change": 0,
-                        "change_percent": 0,
+                        "change": change,
+                        "change_percent": change_percent,
                     }
 
                     await safe_send_json({"data": payload, "guid": _guid})
@@ -1218,17 +1512,17 @@ async def stream(ws: WebSocket):
                         error_evt.set()
                         return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
-                    async def _on_live_quote(q: dict):
+                    async def _on_live_quote(q: dict, _guid: str):
                         nonlocal history_done
                         if not history_done:
                             live_buffer.append(q)
                             return
-                        await send_quote_astras(q)
+                        await send_quote_astras(q, _guid)
 
                     asyncio.create_task(
                         adapter.subscribe_quotes(
                             symbol=symbol,
-                            on_data=lambda q: asyncio.create_task(_on_live_quote(q)),
+                            on_data=lambda q, _g=sub_guid: asyncio.create_task(_on_live_quote(q, _g)),
                             stop_event=stop,
                             on_subscribed=_on_subscribed,
                             on_error=_on_error,
@@ -1259,7 +1553,7 @@ async def stream(ws: WebSocket):
                     # Сначала то, что успело прийти в буфер
                     if live_buffer:
                         for q in live_buffer:
-                            await send_quote_astras(q)
+                            await send_quote_astras(q, sub_guid)
                         live_buffer.clear()
 
                 continue
@@ -1276,10 +1570,16 @@ async def stream(ws: WebSocket):
 
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
+
+                # если Astras переиспользовал guid — остановим старую подписку с этим guid
+                old = subs.pop(sub_guid, None)
+                if old:
+                    old.set()
+
                 subs[sub_guid] = stop
                 exchange_out = "OKX"
 
-                async def send_trade_astras(t: dict, existing_flag: bool, _guid=sub_guid):
+                async def send_trade_astras(t: dict, existing_flag: bool, _guid: str):
                     ts_ms = int(t.get("ts", 0) or 0)
                     date_iso = _iso_from_unix_ms(ts_ms) if ts_ms else None
 
@@ -1343,16 +1643,16 @@ async def stream(ws: WebSocket):
                     error_evt.set()
                     return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
-                async def _on_live_trade(tr: dict):
+                async def _on_live_trade(tr: dict, _guid: str):
                     nonlocal history_done
                     if not history_done:
                         live_buffer.append(tr)
                         return
-                    await send_trade_astras(tr, False)  # existing=False — новые события (OKX WS)
+                    await send_trade_astras(tr, False, _guid)  # existing=False — новые события (OKX WS)
 
                 asyncio.create_task(
                     adapter.subscribe_trades(
-                        on_data=lambda tr: asyncio.create_task(_on_live_trade(tr)),
+                        on_data=lambda tr, _g=sub_guid: asyncio.create_task(_on_live_trade(tr, _g)),
                         stop_event=stop,
                         inst_type="SPOT",
                         on_subscribed=_on_subscribed,
@@ -1383,7 +1683,7 @@ async def stream(ws: WebSocket):
                     try:
                         history = await adapter.get_trades_history(inst_type="SPOT", limit=100)
                         for tr in history:
-                            await send_trade_astras(tr, True)  # existing=True — данные из снепшота/истории (REST)
+                            await send_trade_astras(tr, True, sub_guid)  # existing=True — данные из снепшота/истории (REST)
                     except Exception:
                         pass
 
@@ -1393,7 +1693,7 @@ async def stream(ws: WebSocket):
                 # Сначала то, что успело прийти в буфер
                 if live_buffer:
                     for tr in live_buffer:
-                        await send_trade_astras(tr, False)
+                        await send_trade_astras(tr, False, sub_guid)
                     live_buffer.clear()
 
                 continue

@@ -364,6 +364,7 @@ class OkxAdapter:
         low_24h = self._to_float(item.get("low24h"))
 
         vol_24h_base = self._to_float(item.get("vol24h"))
+        open_24h = self._to_float(item.get("open24h"))
 
         return {
             "symbol": symbol,
@@ -375,8 +376,71 @@ class OkxAdapter:
             "ask_sz": ask_sz,
             "high24h": high_24h,
             "low24h": low_24h,
+            "open24h": open_24h, 
             "vol24h": vol_24h_base,
         }
+
+    #REST: котировка (tickers) — те же поля, что и WS tickers
+    async def get_ticker(self, symbol: str) -> Dict[str, Any]:
+        """
+        Возвращает котировку OKX через REST в нейтральном формате (как subscribe_quotes / WS tickers):
+        {
+          "symbol": "...",
+          "ts": <ms>,
+          "last": <float>,
+          "bid": <float>,
+          "ask": <float>,
+          "bid_sz": <float>,
+          "ask_sz": <float>,
+          "high24h": <float>,
+          "low24h": <float>,
+          "open24h": <float>,
+          "vol24h": <float>
+        }
+
+        OKX endpoint: /market/ticker?instId=...
+        """
+        raw = await self._request_public(
+            path="/market/ticker",
+            params={"instId": symbol},
+        )
+
+        items = raw.get("data") or []
+        if not items:
+            # если данных нет — возвращаем нейтральный формат с нулями
+            return {
+                "symbol": symbol,
+                "ts": 0,
+                "last": 0.0,
+                "bid": 0.0,
+                "ask": 0.0,
+                "bid_sz": 0.0,
+                "ask_sz": 0.0,
+                "high24h": 0.0,
+                "low24h": 0.0,
+                "open24h": 0.0,
+                "vol24h": 0.0,
+            }
+
+        return self._parse_okx_ticker_any(symbol, items[0])
+
+    #REST: список котировок (tickers) — те же поля, что и WS tickers
+    async def list_tickers(self, inst_type: str = "SPOT") -> List[Dict[str, Any]]:
+        """
+        Возвращает список котировок OKX через REST в нейтральном формате (как WS tickers).
+
+        OKX endpoint: /market/tickers?instType=...
+        """
+        raw = await self._request_public(
+            path="/market/tickers",
+            params={"instType": inst_type},
+        )
+
+        out: List[Dict[str, Any]] = []
+        for item in raw.get("data", []) or []:
+            sym = item.get("instId") or "0"
+            out.append(self._parse_okx_ticker_any(sym, item))
+        return out
 
     #получение истории свечей через REST /market/history-candles
     async def get_bars_history(
