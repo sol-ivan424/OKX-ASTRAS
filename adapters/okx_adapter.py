@@ -442,6 +442,108 @@ class OkxAdapter:
             out.append(self._parse_okx_ticker_any(sym, item))
         return out
 
+    #REST: стакан (books) — снепшот (existing=True) в нейтральном формате как WS books
+    async def get_order_book_rest(self, symbol: str, depth: int = 20) -> Dict[str, Any]:
+        """
+        Возвращает снепшот стакана OKX через REST в нейтральном формате (как subscribe_order_book):
+        {
+          "symbol": "...",
+          "ts": <ms>,
+          "bids": [(price, volume), ...],
+          "asks": [(price, volume), ...],
+          "existing": True
+        }
+
+        OKX endpoint: /market/books?instId=...&sz=...
+        sz = глубина (максимум зависит от OKX; обычно 1..400). Мы используем то, что просит Astras (например 10/20/50).
+        """
+        # OKX REST books: sz обязателен и должен быть строкой/числом
+        depth_i = int(depth) if depth is not None else 20
+        if depth_i <= 0:
+            depth_i = 20
+
+        raw = await self._request_public(
+            path="/market/books",
+            params={"instId": symbol, "sz": str(depth_i)},
+        )
+
+        items = raw.get("data") or []
+        if not items:
+            return {
+                "symbol": symbol,
+                "ts": 0,
+                "bids": [],
+                "asks": [],
+                "existing": True,
+            }
+
+        # В REST books data обычно приходит объект со строковыми bids/asks и ts
+        return self._parse_okx_order_book_any(symbol, items[0], existing=True)
+
+    #REST: снепшот котировки для формирования ответа на Astras REST /quotes
+    async def get_quote_snapshot_rest(self, symbol: str, book_depth: int = 20) -> Dict[str, Any]:
+        """
+        Возвращает снепшот котировки OKX через REST в расширенном нейтральном формате для server.py.
+
+        Основа берётся из REST ticker (как get_ticker / WS tickers), плюс доп. поля из REST books:
+        - ob_ts: временная метка стакана (ms)
+        - total_bid_vol / total_ask_vol: сумма объёмов по уровням, полученным из REST books
+
+        Формат:
+        {
+          "symbol": "...",
+          "ts": <ms>,                 # timestamp тикера
+          "last": <float>,
+          "bid": <float>,
+          "ask": <float>,
+          "bid_sz": <float>,
+          "ask_sz": <float>,
+          "high24h": <float>,
+          "low24h": <float>,
+          "open24h": <float>,
+          "vol24h": <float>,          # объём в базовой валюте за 24ч
+          "ob_ts": <ms>,              # timestamp стакана (ms) или 0
+          "total_bid_vol": <float>,   # сумма size по bids из books (в базовой валюте)
+          "total_ask_vol": <float>    # сумма size по asks из books (в базовой валюте)
+        }
+        """
+        # 1) Тикер (REST /market/ticker) — те же поля, что и WS tickers
+        t = await self.get_ticker(symbol)
+
+        # 2) Стакан (REST /market/books) — для ob_ts и суммарных объёмов
+        try:
+            ob = await self.get_order_book_rest(symbol, depth=book_depth)
+        except Exception:
+            ob = {"ts": 0, "bids": [], "asks": []}
+
+        ob_ts = int(ob.get("ts", 0) or 0)
+
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+
+        # Суммарные объёмы считаем строго по тем уровням, которые вернул OKX REST books.
+        total_bid_vol = 0.0
+        for _p, _v in bids:
+            try:
+                total_bid_vol += float(_v)
+            except Exception:
+                continue
+
+        total_ask_vol = 0.0
+        for _p, _v in asks:
+            try:
+                total_ask_vol += float(_v)
+            except Exception:
+                continue
+
+        # Возвращаем расширенный нейтральный формат для server.py
+        return {
+            **t,
+            "ob_ts": ob_ts,
+            "total_bid_vol": total_bid_vol,
+            "total_ask_vol": total_ask_vol,
+        }
+
     #получение истории свечей через REST /market/history-candles
     async def get_bars_history(
         self,

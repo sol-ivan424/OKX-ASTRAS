@@ -20,7 +20,8 @@
 
 
 1. нужно ли делать возмоность множественных одинаковых подписок?
-2. 389, 474, 453, 122, 447, 400, 429 строка - костыль
+2. 389, 474, 453, 122, 447, 400, 429 строка - костыль (устарели номера строк)
+3. ошибки таймаута сами придумали
 """
 
 
@@ -179,33 +180,198 @@ async def hyperion(request: Request):
 
     items = list(_INSTR_CACHE.values())
 
-    # --- поиск по symbol.contains ---
-    symbol_contains = (
-        (where.get("basicInformation") or {})
-        .get("symbol", {})
-        .get("contains")
-    )
-    if symbol_contains:
-        q = str(symbol_contains).upper()
-        items = [x for x in items if q in str(x.get("symbol", "")).upper()]
+    # --- универсальный поиск (where.and[]) ---
+    and_filters = (where.get("and") or [])
+
+    def _match(item: dict, cond: dict) -> bool:
+        # --- basicInformation ---
+        bi = cond.get("basicInformation")
+        if bi:
+            if "symbol" in bi and "contains" in bi["symbol"]:
+                if bi["symbol"]["contains"].upper() not in (item.get("symbol") or "").upper():
+                    return False
+
+            if "shortName" in bi and "contains" in bi["shortName"]:
+                if bi["shortName"]["contains"].upper() not in (item.get("symbol") or "").upper():
+                    return False
+
+        # --- currencyInformation ---
+        ci = cond.get("currencyInformation")
+        if ci:
+            if "nominal" in ci and "contains" in ci["nominal"]:
+                if ci["nominal"]["contains"].upper() not in (item.get("quoteCcy") or "").upper():
+                    return False
+
+
+        # --- tradingDetails (ФИЛЬТРУЕМ ПО TICKERS) ---
+        td = cond.get("tradingDetails")
+        if td:
+            symbol = item.get("symbol")
+            t = ticker_map.get(symbol)
+
+            # если нет тикера — фильтр не проходит
+            if not t:
+                return False
+
+            # вычисляем значения так же, как в _make_node
+            last = t.get("last")
+            open24h = t.get("open24h")
+            high24h = t.get("high24h")
+            low24h = t.get("low24h")
+            vol24h = t.get("vol24h")
+
+            if open24h is not None and open24h != 0 and last is not None:
+                daily_growth = last - open24h
+                daily_growth_percent = (daily_growth / open24h) * 100.0
+            else:
+                daily_growth = None
+                daily_growth_percent = None
+
+            field_map = {
+                "price": last,
+                "priceMax": high24h,
+                "priceMin": low24h,
+                "dailyGrowth": daily_growth,
+                "dailyGrowthPercent": daily_growth_percent,
+                "tradeVolume": vol24h,
+                "tradeAmount": (vol24h * last) if (vol24h is not None and last is not None) else None,
+            }
+
+            for field, rules in td.items():
+                value = field_map.get(field)
+
+                if value is None:
+                    return False
+
+                if "gte" in rules and value < rules["gte"]:
+                    return False
+
+                if "lte" in rules and value > rules["lte"]:
+                    return False
+
+        return True
+
+    if and_filters:
+        filtered = []
+        for item in items:
+            if all(_match(item, f) for f in and_filters):
+                filtered.append(item)
+        items = filtered
 
     total_count = len(items)
 
 
-        # --- сортировка (Astras передаёт variables.order) ---
+    # --- сортировка (Astras передаёт variables.order) ---
     order_spec = variables.get("order") or []
 
-    sort_dir = None
-    for o in order_spec:
-        bi = (o or {}).get("basicInformation") or {}
-        sym_dir = bi.get("symbol")
-        if sym_dir in ("ASC", "DESC"):
-            sort_dir = sym_dir
-            break
+    # Предварительно считаем "значения сортировки" 1 раз на инструмент (оптимизация)
+    sort_cache: dict[str, dict] = {}
 
-    if sort_dir:
-        rev = (sort_dir == "DESC")
-        items.sort(key=lambda x: str(x.get("symbol") or ""), reverse=rev)
+    def _get_sort_vals(item: dict) -> dict:
+        sym = item.get("symbol") or ""
+        cached = sort_cache.get(sym)
+        if cached is not None:
+            return cached
+
+        t = ticker_map.get(sym, {})  # котировки строго из REST tickers
+        last = t.get("last")
+        open24h = t.get("open24h")
+        high24h = t.get("high24h")
+        low24h = t.get("low24h")
+        vol24h = t.get("vol24h")
+
+        if open24h not in (None, 0) and last is not None:
+            daily_growth = last - open24h
+            daily_growth_percent = (daily_growth / open24h) * 100.0
+        else:
+            daily_growth = None
+            daily_growth_percent = None
+
+        inst_type = item.get("instType") or "SPOT"
+        tick_sz = item.get("tickSz")
+        lot_sz = item.get("lotSz")
+        quote_ccy = item.get("quoteCcy")
+
+        cached = {
+            # basicInformation
+            "symbol": sym,
+            "shortName": sym,
+            "market": inst_type,            # basicInformation.market
+
+            # currencyInformation
+            "nominal": quote_ccy,           # currencyInformation.nominal
+
+            # boardInformation
+            "board": inst_type,             # boardInformation.board
+
+            # tradingDetails (из instruments)
+            "minStep": tick_sz,
+            "priceStep": tick_sz,
+            "lotSize": lot_sz,
+
+            # tradingDetails (из tickers)
+            "price": last,
+            "priceMax": high24h,
+            "priceMin": low24h,
+            "dailyGrowth": daily_growth,
+            "dailyGrowthPercent": daily_growth_percent,
+            "tradeVolume": vol24h,
+            "tradeAmount": (vol24h * last) if (vol24h is not None and last is not None) else None,
+        }
+
+        sort_cache[sym] = cached
+        return cached
+
+    def _apply_sort(field: str, direction: str):
+        rev = (direction == "DESC")
+        # None всегда уходит вниз (и при ASC, и при DESC)
+        items.sort(
+            key=lambda x: (
+                _get_sort_vals(x).get(field) is None,
+                _get_sort_vals(x).get(field),
+            ),
+            reverse=rev,
+        )
+
+    # В Astras может быть несколько сортировок: применяем стабильной сортировкой
+    # Сначала второстепенные, потом главные (поэтому reverse)
+    for o in reversed(order_spec):
+        o = o or {}
+
+        # basicInformation: symbol / shortName / market
+        bi = o.get("basicInformation") or {}
+        for field, direction in bi.items():
+            if direction in ("ASC", "DESC") and field in ("symbol", "shortName", "market"):
+                _apply_sort(field, direction)
+
+        # currencyInformation: nominal
+        ci = o.get("currencyInformation") or {}
+        for field, direction in ci.items():
+            if direction in ("ASC", "DESC") and field in ("nominal",):
+                _apply_sort(field, direction)
+
+        # boardInformation: board
+        bo = o.get("boardInformation") or {}
+        for field, direction in bo.items():
+            if direction in ("ASC", "DESC") and field in ("board",):
+                _apply_sort(field, direction)
+
+        # tradingDetails: price/priceMax/priceMin/minStep/priceStep/dailyGrowth/...
+        td = o.get("tradingDetails") or {}
+        for field, direction in td.items():
+            if direction in ("ASC", "DESC") and field in (
+                "price",
+                "priceMax",
+                "priceMin",
+                "minStep",
+                "priceStep",
+                "dailyGrowth",
+                "dailyGrowthPercent",
+                "tradeVolume",
+                "tradeAmount",
+                "lotSize",
+            ):
+                _apply_sort(field, direction)
 
     # --- пагинация по after (cursor = индекс) ---
     start_idx = 0
@@ -238,6 +404,7 @@ async def hyperion(request: Request):
         high24h = t.get("high24h")
         low24h = t.get("low24h")
         vol24h = t.get("vol24h")
+        
 
         # Рост за день считаем от open24h (цена 24 часа назад)
         if open24h is not None and open24h != 0 and last is not None:
@@ -285,7 +452,7 @@ async def hyperion(request: Request):
 
                 # объёмы (24h, базовая валюта)
                 "tradeVolume": vol24h,
-                "tradeAmount": None,
+                "tradeAmount": (vol24h * last) if (vol24h is not None and last is not None) else None,
 
                 # остальное Astras допускает как null
                 "capitalization": None,
@@ -762,8 +929,95 @@ async def md_history(
     })
 
 @app.get("/md/v2/Securities/{broker_symbol}/quotes")
-def md_quotes_stub(broker_symbol: str):
-    return JSONResponse([])
+async def md_quotes(broker_symbol: str):
+    # broker_symbol приходит как "OKX:BTC-USDT"
+    symbol = broker_symbol
+    if ":" in broker_symbol:
+        symbol = broker_symbol.split(":", 1)[1]
+
+    exchange_out = "OKX"
+
+    t = await adapter.get_quote_snapshot_rest(symbol=symbol)
+
+    ts_ms = int(t.get("ts", 0) or 0)
+    ts_sec = int(ts_ms / 1000) if ts_ms else 0
+
+    last_price = t.get("last", 0) or 0
+    bid = t.get("bid", 0) or 0
+    ask = t.get("ask", 0) or 0
+
+    bid_sz = t.get("bid_sz", 0) or 0
+    ask_sz = t.get("ask_sz", 0) or 0
+
+    high_price = t.get("high24h", 0) or 0
+    low_price = t.get("low24h", 0) or 0
+
+    # open24h = "цена 24 часа назад"
+    open_price = t.get("open24h", 0) or 0
+
+    # volume = объём за 24ч в базовой валюте
+    volume = t.get("vol24h", 0) or 0
+
+    # change / change_percent строго от open24h
+    if open_price > 0:
+        change = last_price - open_price
+        change_percent = (change / open_price) * 100.0
+    else:
+        change = 0.0
+        change_percent = 0.0
+
+    # ob_ms_timestamp + totals из REST books
+    ob_ms_timestamp = t.get("ob_ts")
+    total_bid_vol = t.get("total_bid_vol", 0) or 0
+    total_ask_vol = t.get("total_ask_vol", 0) or 0
+
+    payload = {
+        "symbol": symbol,
+        "exchange": exchange_out,
+        "description": None,
+
+        # по документации это "цена предыдущего закрытия",
+        # но строго её нет — используем open24h
+        "prev_close_price": open_price,
+
+        "last_price": last_price,
+        "last_price_timestamp": ts_sec,
+
+        "high_price": high_price,
+        "low_price": low_price,
+
+        "accruedInt": 0,
+        "volume": volume,
+
+        "open_interest": None,
+
+        "ask": ask,
+        "bid": bid,
+
+        "ask_vol": ask_sz,
+        "bid_vol": bid_sz,
+
+        "ob_ms_timestamp": ob_ms_timestamp,
+
+        # open_price = open24h
+        "open_price": open_price,
+        "yield": None,
+
+        "lotsize": 0,
+        "lotvalue": 0,
+        "facevalue": 0,
+        "type": "0",
+
+        "total_bid_vol": total_bid_vol,
+        "total_ask_vol": total_ask_vol,
+
+        "accrued_interest": 0,
+
+        "change": change,
+        "change_percent": change_percent,
+    }
+
+    return JSONResponse([payload])
 
 @app.get("/md/v2/Securities")
 async def md_securities_root(
@@ -1241,7 +1495,8 @@ async def stream(ws: WebSocket):
                 # эти поля Astras сейчас не влияют на OKX (оставляем как есть)
                 exchange = msg.get("exchange")  #адаптер игнорирует
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
-                data_format = msg.get("format")  #адаптер игнорирует
+                data_format = msg.get("format")  # "Simple" | "Slim" | "Heavy"
+                data_format_norm = data_format.strip().lower()
 
                 async def on_book(book: dict, _guid: str):
                     now_ms = int(time.time() * 1000)
@@ -1279,15 +1534,23 @@ async def stream(ws: WebSocket):
                     bids = [{"price": p, "volume": v} for (p, v) in bids_in]
                     asks = [{"price": p, "volume": v} for (p, v) in asks_in]
 
-                    payload = {
-                        # snapshot и timestamp устаревшие
-                        "snapshot": existing_flag,
-                        "bids": bids,
-                        "asks": asks,
-                        "timestamp": ts_sec,
-                        "ms_timestamp": ms_ts,
-                        "existing": existing_flag,
-                    }
+                    if data_format_norm == "slim":
+                        payload = {
+                            "b": [{"p": float(p), "v": float(v)} for (p, v) in bids_in],
+                            "a": [{"p": float(p), "v": float(v)} for (p, v) in asks_in],
+                            "t": ms_ts,
+                            "h": bool(existing_flag),
+                        }
+
+                    elif data_format_norm == "simple":
+                        payload = {
+                            "snapshot": existing_flag,
+                            "bids": [{"price": float(p), "volume": float(v)} for (p, v) in bids_in],
+                            "asks": [{"price": float(p), "volume": float(v)} for (p, v) in asks_in],
+                            "timestamp": ts_sec,
+                            "ms_timestamp": ms_ts,
+                            "existing": existing_flag,
+                        }
 
                     await safe_send_json({"data": payload, "guid": _guid})
 
