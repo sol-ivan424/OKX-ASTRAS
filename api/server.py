@@ -22,6 +22,8 @@
 1. нужно ли делать возмоность множественных одинаковых подписок?
 2. 389, 474, 453, 122, 447, 400, 429 строка - костыль (устарели номера строк)
 3. ошибки таймаута сами придумали
+4. документация для карты рынка
+5. размер и структура файлов
 """
 
 
@@ -162,6 +164,10 @@ async def hyperion(request: Request):
     variables = body.get("variables", {}) or {}
     where = variables.get("where") or {}
 
+    query_str = body.get("query") or ""
+    # Если Astras запрашивает instrument(...) — нужно вернуть data.instrument
+    want_single_instrument = ("instrument(" in query_str) and ("instruments" not in query_str)
+
     first = variables.get("first", 20)
     try:
         first = int(first)
@@ -171,11 +177,28 @@ async def hyperion(request: Request):
 
     after = variables.get("after")
 
-    # Быстро "попробовать" обновить кеши (с TTL + timeout внутри)
     await _ensure_instr_cache()
-    # Всегда свежие котировки для Hyperion
-    tickers = await adapter.list_tickers(inst_type="SPOT")
-    ticker_map = {t["symbol"]: t for t in tickers if t.get("symbol")}
+    # Всегда свежие котировки для Hyperion:
+    # В таблице «Все инструменты» одновременно есть SPOT/FUTURES/SWAP,
+    # поэтому собираем tickers сразу для всех типов и объединяем по symbol.
+    async def _load_ticker_map() -> dict:
+        inst_types = ("SPOT", "FUTURES", "SWAP")
+
+        results = await asyncio.gather(
+            *(adapter.list_tickers(inst_type=it) for it in inst_types),
+            return_exceptions=True,
+        )
+
+        merged: list[dict] = []
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            if r:
+                merged.extend(r)
+
+        return {t.get("symbol"): t for t in merged if t.get("symbol")}
+
+    ticker_map = await _load_ticker_map()
 
 
     items = list(_INSTR_CACHE.values())
@@ -287,7 +310,7 @@ async def hyperion(request: Request):
             daily_growth = None
             daily_growth_percent = None
 
-        inst_type = item.get("instType") or "SPOT"
+        inst_type = item.get("instType")
         tick_sz = item.get("tickSz")
         lot_sz = item.get("lotSz")
         quote_ccy = item.get("quoteCcy")
@@ -393,7 +416,7 @@ async def hyperion(request: Request):
 
     def _make_node(raw: dict) -> dict:
         symbol = raw.get("symbol")
-        inst_type = raw.get("instType") or "SPOT"
+        inst_type = raw.get("instType")
         quote_ccy = raw.get("quoteCcy")
 
         # Котировки строго по symbol из REST tickers (okx_adapter.list_tickers)
@@ -469,6 +492,23 @@ async def hyperion(request: Request):
             },
         }
 
+    # --- SINGLE instrument (GraphQL instrument(...)) ---
+    if want_single_instrument:
+        sym = variables.get("symbol")
+        await _ensure_instr_cache()
+
+        raw = _INSTR_CACHE.get(sym) if sym else None
+        if raw is None:
+            raw = next(iter(_INSTR_CACHE.values()), None)
+
+        node = _make_node(raw) if raw else None
+
+        return JSONResponse({
+            "data": {
+                "instrument": node
+            }
+        })
+    
     nodes = [_make_node(x) for x in sliced]
 
     edges = []
@@ -729,8 +769,17 @@ _INSTR_TTL_SEC = 60.0
 
 async def _refresh_instr_cache():
     global _INSTR_CACHE, _INSTR_CACHE_TS
-    raw = await adapter.list_instruments()
-    _INSTR_CACHE = {x.get("symbol"): x for x in (raw or []) if x.get("symbol")}
+    raw_all: list[dict] = []
+
+    for inst_type in ("SPOT", "FUTURES", "SWAP"):
+        try:
+            part = await adapter.list_instruments(inst_type=inst_type)
+            if part:
+                raw_all.extend(part)
+        except Exception:
+            continue
+
+    _INSTR_CACHE = {x.get("symbol"): x for x in (raw_all or []) if x.get("symbol")}
     _INSTR_CACHE_TS = time.time()
 
 
@@ -743,7 +792,7 @@ async def _ensure_instr_cache():
             return
         # не висим на OKX
         try:
-            await asyncio.wait_for(_refresh_instr_cache(), timeout=3.0)
+            await _refresh_instr_cache()
         except Exception:
             return
 
@@ -755,178 +804,8 @@ async def _get_instr(symbol: str) -> Optional[dict]:
 
 async def _astras_instruments() -> list[dict]:
     # Единый источник инструментов (как и /v2/instruments)
-    raw = await adapter.list_instruments()
-    return [_astras_instrument_simple(x) for x in raw]
-
-@app.get("/md/v2/Securities/{exchange}/{symbol}")
-async def md_security(exchange: str, symbol: str, instrumentGroup: str | None = None):
-    # Гарантируем, что UI никогда не получит 404
-    if not _INSTR_CACHE:
-        await _refresh_instr_cache()
-
-    instr = _INSTR_CACHE.get(symbol)
-
-    # Если Astras запросил MOEX/IMOEX — отдаём любой реальный OKX-инструмент
-    if instr is None:
-        instr = next(iter(_INSTR_CACHE.values()), None)
-
-    if instr is None:
-        raise HTTPException(status_code=404, detail="No instruments")
-
-    x = _astras_instrument_simple(instr)
-
-    # Подменяем только routing-поля (это ожидает Astras)
-    #x["exchange"] = exchange
-    if instrumentGroup:
-        x["board"] = instrumentGroup
-        x["primary_board"] = instrumentGroup
-
-    return JSONResponse(x)
-
-
-@app.get("/md/v2/Securities/{exchange}")
-async def md_securities(
-    exchange: str,
-    query: str | None = None,
-    limit: int = 200,
-    instrumentGroup: str | None = None,
-):
-    if not _INSTR_CACHE:
-        await _refresh_instr_cache()
-
-    items = list(_INSTR_CACHE.values())
-
-    if query:
-        q = str(query).upper()
-        items = [x for x in items if q in str(x.get("symbol", "")).upper()]
-
-    items = items[: max(1, min(limit, 1000))]
-
-    out: list[dict] = []
-    for raw in items:
-        x = _astras_instrument_simple(raw)
-        #x["exchange"] = exchange
-        if instrumentGroup:
-            x["board"] = instrumentGroup
-            x["primary_board"] = instrumentGroup
-        out.append(x)
-
-    return JSONResponse(out)
-
-@app.get("/md/v2/Securities/{exchange}/{symbol}/availableBoards")
-async def md_security_available_boards(
-    exchange: str,
-    symbol: str,
-    instrumentGroup: str | None = None,
-):
-    # Проверяем, что инструмент существует
-    instr = await _get_instr(symbol)
-
-    # Astras ждёт массив строк с board
-    return JSONResponse([
-        instrumentGroup or "SPOT"
-    ])
-
-@app.get("/md/v2/boards")
-def md_boards():
-    return JSONResponse(["SPOT"])
-
-@app.get("/instruments/v1/TreeMap")
-async def instruments_treemap(market: str | None = None, limit: int = 50):
-    if not _INSTR_CACHE:
-        await _refresh_instr_cache()
-
-    items = list(_INSTR_CACHE.values())
-    items = items[: max(1, min(limit, 1000))]
-
-    # Astras ожидает массив объектов инструментов
-    out = []
-    for raw in items:
-        x = _astras_instrument_simple(raw)
-
-        # важно: чтобы не было "MOEX/TQBR" мусора в treemap
-        x["exchange"] = "OKX"
-        x["board"] = "SPOT"
-        x["primary_board"] = "SPOT"
-
-        out.append(x)
-
-    return JSONResponse({"displayItems": out})
-
-@app.get("/md/v2/history")
-async def md_history(
-    symbol: str,
-    exchange: str,
-    from_: int = Query(alias="from"),
-    to: int = Query(...),
-    tf: str = "D",
-    countBack: int = 300,
-):
-    # Astras ожидает объект: {history:[...], next:<int|null>, prev:<int|null>}
-    # Используем ту же историю, что и в WS (adapter.get_bars_history)
-
-    tf_in = (tf or "D").upper()
-    if tf_in in ("D", "1D"):
-        tf_okx = "1D"
-        step = 86400
-    elif tf_in in ("H", "1H"):
-        tf_okx = "1H"
-        step = 3600
-    elif tf_in in ("M", "1M", "1MIN", "MIN", "1MINS"):
-        tf_okx = "1m"
-        step = 60
-    else:
-        tf_okx = tf
-        step = None
-
-    items: list[dict] = []
-    if hasattr(adapter, "get_bars_history"):
-        try:
-            raw = await adapter.get_bars_history(
-                symbol=symbol,
-                tf=str(tf_okx),
-                from_ts=int(from_ or 0),
-            )
-            for b in (raw or []):
-                ts_ms = int(b.get("ts", 0) or 0)
-                t_sec = int(ts_ms / 1000) if ts_ms else 0
-                if t_sec and int(to) and t_sec > int(to):
-                    continue
-
-                v = b.get("volume", 0)
-
-                items.append({
-                    "time": t_sec,
-                    "close": b.get("close", 0),
-                    "open": b.get("open", 0),
-                    "high": b.get("high", 0),
-                    "low": b.get("low", 0),
-                    "volume": v,
-                })
-        except Exception:
-            items = []
-
-    try:
-        cb = int(countBack or 0)
-    except Exception:
-        cb = 0
-    if cb > 0 and len(items) > cb:
-        items = items[-cb:]
-
-    if items and step:
-        first_t = items[0].get("time")
-        last_t = items[-1].get("time")
-        prev_t = (int(first_t) - step) if first_t else None
-        next_t = (int(last_t) + step) if last_t else None
-    else:
-        prev_t = None
-        next_t = None
-
-    return JSONResponse({
-        "history": items,
-        "next": next_t,
-        "prev": prev_t,
-    })
+    await _ensure_instr_cache()
+    return [_astras_instrument_simple(x) for x in list(_INSTR_CACHE.values())]
 
 @app.get("/md/v2/Securities/{broker_symbol}/quotes")
 async def md_quotes(broker_symbol: str):
@@ -1019,6 +898,170 @@ async def md_quotes(broker_symbol: str):
 
     return JSONResponse([payload])
 
+@app.get("/md/v2/Securities/{exchange}/{symbol}")
+async def md_security(exchange: str, symbol: str, instrumentGroup: str | None = None):
+    # Гарантируем, что UI никогда не получит 404
+    if not _INSTR_CACHE:
+        await _refresh_instr_cache()
+
+    instr = _INSTR_CACHE.get(symbol)
+
+    # Если Astras запросил MOEX/IMOEX — отдаём любой реальный OKX-инструмент
+    if instr is None:
+        instr = next(iter(_INSTR_CACHE.values()), None)
+
+    if instr is None:
+        raise HTTPException(status_code=404, detail="No instruments")
+
+    x = _astras_instrument_simple(instr)
+
+    # Подменяем только routing-поля (это ожидает Astras)
+    #x["exchange"] = exchange
+    if instrumentGroup:
+        x["board"] = instrumentGroup
+        x["primary_board"] = instrumentGroup
+
+    return JSONResponse(x)
+
+
+@app.get("/md/v2/Securities/{exchange}")
+async def md_securities(
+    exchange: str,
+    query: str | None = None,
+    limit: int = 200,
+    instrumentGroup: str | None = None,
+):
+    if not _INSTR_CACHE:
+        await _refresh_instr_cache()
+
+    items = list(_INSTR_CACHE.values())
+
+    if query:
+        q = str(query).upper()
+        items = [x for x in items if q in str(x.get("symbol", "")).upper()]
+
+    items = items[: max(1, min(limit, 1000))]
+
+    out: list[dict] = []
+    for raw in items:
+        x = _astras_instrument_simple(raw)
+        #x["exchange"] = exchange
+        if instrumentGroup:
+            x["board"] = instrumentGroup
+            x["primary_board"] = instrumentGroup
+        out.append(x)
+
+    return JSONResponse(out)
+
+SUPPORTED_BOARDS = ["SPOT", "FUTURES", "SWAP"]
+
+@app.get("/md/v2/Securities/{exchange}/{symbol}/availableBoards")
+async def md_security_available_boards(
+    exchange: str,
+    symbol: str,
+):
+    return JSONResponse(SUPPORTED_BOARDS)
+
+@app.get("/md/v2/boards")
+def md_boards():
+    return JSONResponse(SUPPORTED_BOARDS)
+
+@app.get("/instruments/v1/TreeMap")
+async def instruments_treemap(market: str | None = None, limit: int = 50):
+    if not _INSTR_CACHE:
+        await _refresh_instr_cache()
+
+    items = list(_INSTR_CACHE.values())
+    items = items[: max(1, min(limit, 1000))]
+
+    # Astras ожидает массив объектов инструментов
+    out = []
+    for raw in items:
+        x = _astras_instrument_simple(raw)
+
+        x["exchange"] = "OKX"
+        x["board"] = "SPOT"
+        x["primary_board"] = "SPOT"
+
+        out.append(x)
+
+    return JSONResponse({"displayItems": out})
+
+@app.get("/md/v2/history")
+async def md_history(
+    symbol: str,
+    exchange: str,
+    from_: int = Query(alias="from"),
+    to: int = Query(...),
+    tf: str = "D",
+    countBack: int = 300,
+):
+    # Astras ожидает объект: {history:[...], next:<int|null>, prev:<int|null>}
+    # Используем ту же историю, что и в WS (adapter.get_bars_history)
+
+    tf_in = (tf or "D").upper()
+    if tf_in in ("D", "1D"):
+        tf_okx = "1D"
+        step = 86400
+    elif tf_in in ("H", "1H"):
+        tf_okx = "1H"
+        step = 3600
+    elif tf_in in ("M", "1M", "1MIN", "MIN", "1MINS"):
+        tf_okx = "1m"
+        step = 60
+    else:
+        tf_okx = tf
+        step = None
+
+    items: list[dict] = []
+    if hasattr(adapter, "get_bars_history"):
+        try:
+            raw = await adapter.get_bars_history(
+                symbol=symbol,
+                tf=str(tf_okx),
+                from_ts=int(from_ or 0),
+            )
+            for b in (raw or []):
+                ts_ms = int(b.get("ts", 0) or 0)
+                t_sec = int(ts_ms / 1000) if ts_ms else 0
+                if t_sec and int(to) and t_sec > int(to):
+                    continue
+
+                v = b.get("volume", 0)
+
+                items.append({
+                    "time": t_sec,
+                    "close": b.get("close", 0),
+                    "open": b.get("open", 0),
+                    "high": b.get("high", 0),
+                    "low": b.get("low", 0),
+                    "volume": v,
+                })
+        except Exception:
+            items = []
+
+    try:
+        cb = int(countBack or 0)
+    except Exception:
+        cb = 0
+    if cb > 0 and len(items) > cb:
+        items = items[-cb:]
+
+    if items and step:
+        first_t = items[0].get("time")
+        last_t = items[-1].get("time")
+        prev_t = (int(first_t) - step) if first_t else None
+        next_t = (int(last_t) + step) if last_t else None
+    else:
+        prev_t = None
+        next_t = None
+
+    return JSONResponse({
+        "history": items,
+        "next": next_t,
+        "prev": prev_t,
+    })
+
 @app.get("/md/v2/Securities")
 async def md_securities_root(
     exchange: str | None = None,
@@ -1061,9 +1104,8 @@ async def get_instruments(exchange: str = "OKX", format: str = "Simple", token: 
 
 #    if not token:
 #        raise HTTPException(400, detail="TokenRequired")
-
-    raw = await adapter.list_instruments()
-    return [_astras_instrument_simple(x) for x in raw]
+    await _ensure_instr_cache()
+    return [_astras_instrument_simple(x) for x in list(_INSTR_CACHE.values())]
 
 
 @app.websocket("/stream")
@@ -1167,6 +1209,8 @@ async def stream(ws: WebSocket):
             token = msg.get("token")
             symbols: List[str] = msg.get("symbols", [])
             req_guid = msg.get("guid")
+            # inst_type может приходить как instrumentGroup или как board
+            inst_type = msg.get("instrumentGroup") or msg.get("board")
 
             if opcode == "ping":
                 await safe_send_json({
@@ -1421,7 +1465,7 @@ async def stream(ws: WebSocket):
                         symbols,
                         lambda ord_, _g=sub_guid: asyncio.create_task(_on_live_order(ord_, _g)),
                         stop,
-                        inst_type="SPOT",
+                        inst_type=inst_type,
                         on_subscribed=_on_subscribed,
                         on_error=_on_error,
                     )
@@ -1450,7 +1494,7 @@ async def stream(ws: WebSocket):
                     try:
                         inst_id = symbols[0] if symbols else None
                         history_orders = await adapter.get_orders_pending(
-                            inst_type="SPOT",
+                            inst_type=inst_type,
                             inst_id=inst_id,
                         )
                         for ho in history_orders:
@@ -1477,11 +1521,23 @@ async def stream(ws: WebSocket):
                 code = msg.get("code")
                 depth = int(msg.get("depth", 20) or 20)
 
+                data_format = msg.get("format")  # Astras присылает всегда: "Simple"/"Slim"/...
+                data_format_norm = str(data_format).strip().lower()
+
                 frequency = msg.get("frequency")
                 try:
-                    frequency = int(frequency) if frequency is not None else 25
+                    frequency = int(frequency) if frequency is not None else None
                 except Exception:
-                    frequency = 25
+                    frequency = None
+
+                # если frequency не указан — ставим минимум по формату
+                min_freq = 10 if data_format_norm == "slim" else 25
+
+                if frequency is None:
+                    frequency = min_freq
+                elif frequency < min_freq:
+                    frequency = min_freq
+
 
                 sub_guid = msg.get("guid") or req_guid
 
@@ -1495,8 +1551,6 @@ async def stream(ws: WebSocket):
                 # эти поля Astras сейчас не влияют на OKX (оставляем как есть)
                 exchange = msg.get("exchange")  #адаптер игнорирует
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
-                data_format = msg.get("format")  # "Simple" | "Slim" | "Heavy"
-                data_format_norm = data_format.strip().lower()
 
                 async def on_book(book: dict, _guid: str):
                     now_ms = int(time.time() * 1000)
@@ -1887,7 +1941,7 @@ async def stream(ws: WebSocket):
                     adapter.subscribe_trades(
                         on_data=lambda tr, _g=sub_guid: asyncio.create_task(_on_live_trade(tr, _g)),
                         stop_event=stop,
-                        inst_type="SPOT",
+                        inst_type=inst_type,
                         on_subscribed=_on_subscribed,
                         on_error=_on_error,
                     )
@@ -1914,7 +1968,7 @@ async def stream(ws: WebSocket):
                 # история (если skipHistory == false)
                 if (not skip_history) and hasattr(adapter, "get_trades_history"):
                     try:
-                        history = await adapter.get_trades_history(inst_type="SPOT", limit=100)
+                        history = await adapter.get_trades_history(inst_type=inst_type, limit=100)
                         for tr in history:
                             await send_trade_astras(tr, True, sub_guid)  # existing=True — данные из снепшота/истории (REST)
                     except Exception:

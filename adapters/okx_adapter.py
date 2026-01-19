@@ -14,6 +14,34 @@ import websockets
 
 
 class OkxAdapter:
+    #применение snapshot/update OKX books к локальному состоянию (price -> size)
+    def _apply_okx_book_delta(
+        self,
+        side_state: Dict[float, float],
+        levels: List[Any],
+    ) -> None:
+        """
+        OKX levels: [[price, sz, ...], ...]
+        - если sz == 0 -> уровень удаляется
+        - иначе уровень устанавливается/обновляется
+
+        Важно: OKX в update присылает только изменившиеся уровни.
+        Чтобы всегда отдавать полный стакан нужной глубины, мы храним локальный state
+        и применяем update как дельту.
+        """
+        for lvl in levels or []:
+            if not lvl:
+                continue
+            price = self._to_float(lvl[0]) if len(lvl) > 0 else 0.0
+            sz = self._to_float(lvl[1]) if len(lvl) > 1 else 0.0
+            if price <= 0:
+                continue
+            if sz <= 0:
+                # удаление уровня
+                side_state.pop(price, None)
+            else:
+                # установка/обновление уровня
+                side_state[price] = sz
     """
     Адаптер OKX.
 
@@ -241,9 +269,9 @@ class OkxAdapter:
         for item in raw.get("data", []):
             out.append(
                 {
-                    "symbol": item.get("instId"),
+                    "symbol": item.get("instId") or "",
                     "exchange": "OKX",
-                    "instType": item.get("instType"),
+                    "instType": item.get("instType") or inst_type,
                     "state": item.get("state"),
                     "baseCcy": item.get("baseCcy"),
                     "quoteCcy": item.get("quoteCcy"),
@@ -1084,6 +1112,10 @@ class OkxAdapter:
                     await ws.send(json.dumps(sub_msg))
                     subscribed_sent = False
 
+                    # локальное состояние стакана: price -> size
+                    bids_state: Dict[float, float] = {}
+                    asks_state: Dict[float, float] = {}
+
                     while not stop_event.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -1116,7 +1148,32 @@ class OkxAdapter:
 
                         # OKX обычно присылает список с одним элементом
                         for item in data:
-                            book = self._parse_okx_order_book_any(symbol, item, existing=is_snapshot)
+                            # timestamp стакана
+                            ts_ms = self._to_int(item.get("ts"))
+
+                            # на snapshot мы полностью переинициализируем состояние
+                            if is_snapshot:
+                                bids_state.clear()
+                                asks_state.clear()
+
+                            # применяем дельту update к локальному состоянию
+                            self._apply_okx_book_delta(bids_state, item.get("bids") or [])
+                            self._apply_okx_book_delta(asks_state, item.get("asks") or [])
+
+                            # формируем полный стакан из состояния
+                            bids_full = sorted(bids_state.items(), key=lambda x: x[0], reverse=True)
+                            asks_full = sorted(asks_state.items(), key=lambda x: x[0])
+
+                            # existing=True только для snapshot, existing=False для update,
+                            # но bids/asks всегда полные (после применения дельты)
+                            book = {
+                                "symbol": symbol,
+                                "ts": ts_ms,
+                                "bids": [(float(p), float(v)) for (p, v) in bids_full],
+                                "asks": [(float(p), float(v)) for (p, v) in asks_full],
+                                "existing": bool(is_snapshot),
+                            }
+
                             res = on_data(book)
                             if asyncio.iscoroutine(res):
                                 await res
