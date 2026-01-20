@@ -70,12 +70,17 @@ class OkxAdapter:
 
         self._http_client: Optional[httpx.AsyncClient] = None
 
-        #публичный WS (business) для свечей
-        self._ws_business_url = "wss://ws.okx.com:8443/ws/v5/business"
-        #публичный WS (public) для стаканов/котировок
-        self._ws_public_url = "wss://ws.okx.com:8443/ws/v5/public"
-        #приватный WS для заявок
-        self._ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
+        # WS для свечей у OKX идёт через /ws/v5/business (а не /public)
+        # Иначе OKX отвечает 60018: Wrong URL or channel:candle..., instId ... doesn't exist
+        # Для demo/simulated trading у OKX отдельный хост wspap.okx.com
+        if self._demo:
+            self._ws_candles_url = "wss://wspap.okx.com:8443/ws/v5/business"
+            self._ws_public_url = "wss://wspap.okx.com:8443/ws/v5/public"
+            self._ws_private_url = "wss://wspap.okx.com:8443/ws/v5/private"
+        else:
+            self._ws_candles_url = "wss://ws.okx.com:8443/ws/v5/business"
+            self._ws_public_url = "wss://ws.okx.com:8443/ws/v5/public"
+            self._ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
 
     #универсальное преобразование в float (если нет значения -> 0.0)
     def _to_float(self, v: Any) -> float:
@@ -273,8 +278,10 @@ class OkxAdapter:
                     "exchange": "OKX",
                     "instType": item.get("instType") or inst_type,
                     "state": item.get("state"),
-                    "baseCcy": item.get("baseCcy"),
-                    "quoteCcy": item.get("quoteCcy"),
+                    # SPOT: baseCcy/quoteCcy
+                    # FUTURES/SWAP: у OKX quoteCcy часто пустой, валюты берём из settleCcy/ctValCcy
+                    "baseCcy": item.get("baseCcy") or item.get("ctValCcy"),
+                    "quoteCcy": item.get("quoteCcy") or item.get("settleCcy"),
                     "lotSz": to_opt_float(item.get("lotSz")),
                     "tickSz": to_opt_float(item.get("tickSz")),
                 }
@@ -285,6 +292,7 @@ class OkxAdapter:
     def _tf_to_okx_bar(self, tf: str) -> str:
         tf = str(tf).strip()
         mapping = {
+            # Astras может присылать таймфрейм как секунды (строкой)
             "1": "1s",
             "60": "1m",
             "180": "3m",
@@ -298,6 +306,26 @@ class OkxAdapter:
             "43200": "12H",
             "86400": "1D",
             "604800": "1W",
+
+            "S": "1s",
+            "M": "1m",
+            "H": "1H",
+            "D": "1D",
+            "W": "1W",
+
+            "1s": "1s",
+            "1m": "1m",
+            "3m": "3m",
+            "5m": "5m",
+            "15m": "15m",
+            "30m": "30m",
+            "1H": "1H",
+            "2H": "2H",
+            "4H": "4H",
+            "6H": "6H",
+            "12H": "12H",
+            "1D": "1D",
+            "1W": "1W",
         }
         return mapping.get(tf, "1m")
 
@@ -308,23 +336,24 @@ class OkxAdapter:
 
     #универсальный парсер свечи OKX (WS и REST)
     def _parse_okx_candle_any(self, symbol: str, arr: list) -> dict:
-        """
-        WS: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
-        REST history-candles: [ts,o,h,l,c,vol,volCcy,confirm]
-        ts в миллисекундах
-        """
-        ts_ms = self._to_int(arr[0]) if len(arr) > 0 else 0
-        o = self._to_float(arr[1]) if len(arr) > 1 else 0.0
-        h = self._to_float(arr[2]) if len(arr) > 2 else 0.0
-        l = self._to_float(arr[3]) if len(arr) > 3 else 0.0
-        c = self._to_float(arr[4]) if len(arr) > 4 else 0.0
-        vol = self._to_float(arr[5]) if len(arr) > 5 else 0.0
 
-        confirm = 0
-        if len(arr) >= 9:
-            confirm = self._to_int(arr[8])
-        elif len(arr) >= 8:
-            confirm = self._to_int(arr[7])
+        def _get(a, i, default=None):
+            return a[i] if (a is not None and i < len(a)) else default
+
+        ts_ms = self._to_int(_get(arr, 0, 0))
+        o_raw = _get(arr, 1, None)
+        h_raw = _get(arr, 2, None)
+        l_raw = _get(arr, 3, None)
+        c_raw = _get(arr, 4, None)
+        o = self._to_float(o_raw) if o_raw is not None else None
+        h = self._to_float(h_raw) if h_raw is not None else None
+        l = self._to_float(l_raw) if l_raw is not None else None
+        c = self._to_float(c_raw) if c_raw is not None else None
+        vol_raw = _get(arr, 5, 0.0)
+        vol = self._to_float(vol_raw) if vol_raw is not None else 0.0
+        # confirm может быть на 8 (WS) или на 7 (REST history-candles)
+        confirm_raw = _get(arr, 8, _get(arr, 7, 0))
+        confirm = self._to_int(confirm_raw)
 
         return {
             "symbol": symbol,
@@ -644,6 +673,7 @@ class OkxAdapter:
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
+        #публичный WS (public) для свечей
         channel = self._tf_to_okx_ws_channel(tf)
 
         sub_msg = {
@@ -653,7 +683,7 @@ class OkxAdapter:
 
         while not stop_event.is_set():
             try:
-                async with websockets.connect(self._ws_business_url, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(self._ws_candles_url, ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps(sub_msg))
                     subscribed_sent = False
 

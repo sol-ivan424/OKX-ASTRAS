@@ -24,6 +24,9 @@
 3. ошибки таймаута сами придумали
 4. документация для карты рынка
 5. размер и структура файлов
+
+1. сейчас открытие=закрытие=open24h - скользящее окно 24 часа назад. можно использовать sodUtc0 - open дня по UTC0
+при этом low_price high_price можно только за сутки
 """
 
 
@@ -440,26 +443,54 @@ async def hyperion(request: Request):
 
         return {
             "__typename": "InstrumentModel",
+
+            # Нужные Astras поля (даже если в списке не запрашиваются)
+            "additionalInformation": {
+                "__typename": "InstrumentAdditionalInformation",
+                "cancellation": raw.get("cancellation"),
+                "complexProductCategory": raw.get("complexProductCategory"),
+                "priceMultiplier": raw.get("priceMultiplier"),
+                "priceShownUnits": raw.get("priceShownUnits"),
+            },
+
             "basicInformation": {
                 "__typename": "InstrumentBasicInformation",
+
+                # ключевые поля
                 "symbol": symbol,
                 "exchange": "OKX",
                 "shortName": symbol,
                 "market": inst_type,
                 "gicsSector": None,
+
+                # Astras может запрашивать расширенные поля — отдаём что можем, остальное null
+                "type": raw.get("type"),
+                "complexProductCategory": raw.get("complexProductCategory"),
+                "description": raw.get("description"),
+                "fullDescription": raw.get("fullDescription"),
+                "fullName": raw.get("fullName"),
+                "readableType": raw.get("readableType"),
+                "sector": raw.get("sector"),
             },
-            "currencyInformation": {
-                "__typename": "InstrumentCurrencyInformation",
-                "nominal": quote_ccy,
-            },
+
             "boardInformation": {
                 "__typename": "InstrumentBoardInformation",
                 "board": inst_type,
+                "isPrimaryBoard": True,
+                "primaryBoard": inst_type,
             },
+
+            "currencyInformation": {
+                "__typename": "InstrumentCurrencyInformation",
+                "nominal": quote_ccy,
+                # settlement в крипте по смыслу совпадает с валютой котирования
+                "settlement": quote_ccy,
+            },
+
             "tradingDetails": {
                 "__typename": "InstrumentTradingDetails",
 
-                # цены / шаги — из instruments
+                # шаги/лотность — из instruments
                 "minStep": raw.get("tickSz"),
                 "priceStep": raw.get("tickSz"),
                 "lotSize": raw.get("lotSz"),
@@ -482,6 +513,7 @@ async def hyperion(request: Request):
                 "closingPrice": last if last is not None else None,
                 "rating": None,
             },
+
             "financialAttributes": {
                 "__typename": "InstrumentFinancialAttributes",
                 "cfiCode": raw.get("cfiCode"),
@@ -497,7 +529,17 @@ async def hyperion(request: Request):
         sym = variables.get("symbol")
         await _ensure_instr_cache()
 
+        board_req = variables.get("board")
+        board_req = (str(board_req).strip().upper() if board_req is not None else "")
+
         raw = _INSTR_CACHE.get(sym) if sym else None
+
+        if sym and board_req:
+            for it in _INSTR_CACHE.values():
+                if it.get("symbol") == sym and (it.get("instType") or "").upper() == board_req:
+                    raw = it
+                    break
+
         if raw is None:
             raw = next(iter(_INSTR_CACHE.values()), None)
 
@@ -1281,9 +1323,7 @@ async def stream(ws: WebSocket):
                     h = bar.get("high")
                     l = bar.get("low")
                     c = bar.get("close")
-
-                    # плоские свечи ломают шкалу Astras
-                    if o == h == l == c:
+                    if o is None or h is None or l is None or c is None:
                         return
 
                     ts_ms = bar.get("ts", 0)
@@ -1700,6 +1740,14 @@ async def stream(ws: WebSocket):
                 symbol = code or (symbols[0] if symbols else "")
 
                 async def send_quote_astras(t: dict, _guid: str):
+
+                    last_raw = t.get("last")
+                    bid_raw = t.get("bid")
+                    ask_raw = t.get("ask")
+
+                    # пока OKX не прислал реальные цены — ничего не отправляем
+                    if last_raw is None and bid_raw is None and ask_raw is None:
+                        return
                     now_ms = int(time.time() * 1000)
                     freq_ms = frequency if isinstance(frequency, int) else 25
 
@@ -1712,7 +1760,7 @@ async def stream(ws: WebSocket):
                     ts_ms = int(t.get("ts", 0) or 0)
                     ts_sec = int(ts_ms / 1000) if ts_ms else 0
 
-                    last_price = t.get("last", 0)
+                    last_price = last_raw or 0
                     bid = t.get("bid", 0) or 0
                     ask = t.get("ask", 0) or 0
 
