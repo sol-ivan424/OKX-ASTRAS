@@ -863,6 +863,88 @@ class OkxAdapter:
             out.append(self._parse_okx_order_any(item))
         return out
 
+    #REST: выставление рыночной заявки (market order)
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        inst_type: str = "SPOT",
+        td_mode: Optional[str] = None,
+        pos_side: Optional[str] = None,
+        tgt_ccy: Optional[str] = None,
+        cl_ord_id: Optional[str] = None,
+        ccy: Optional[str] = None, 
+    ) -> Dict[str, Any]:
+        """ 
+        Выставляет рыночную заявку через OKX REST: POST /api/v5/trade/order
+
+        Минимально необходимые параметры по документации OKX:
+        - instId, tdMode, side, ordType, sz
+        Дополнительно:
+        - posSide: требуется в long/short режиме (деривативы)
+        - tgtCcy: для SPOT market buy позволяет указать, в какой валюте задан sz (base_ccy/quote_ccy)
+        - clOrdId: клиентский id
+
+        Возвращает нейтральный результат:
+        {
+          "ordId": "...",
+          "clOrdId": "...",
+          "sCode": "0",
+          "sMsg": ""
+        }
+        """
+
+        inst_id = symbol
+        side_s = str(side or "").lower().strip()
+        if side_s not in ("buy", "sell"):
+            raise ValueError("side must be 'buy' or 'sell'")
+
+        def _fmt_sz(x: float) -> str:
+            s = f"{x:.16f}".rstrip("0").rstrip(".")
+            return s if s else "0"
+
+        # tdMode: SPOT без маржи -> cash, деривативы/маржа -> cross/isolated
+        if td_mode is None:
+            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
+
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side_s,
+            "ordType": "market",
+            "sz": _fmt_sz(quantity),
+        }
+        if cl_ord_id:
+            body["clOrdId"] = str(cl_ord_id)
+        if pos_side:
+            body["posSide"] = str(pos_side)
+        if tgt_ccy:
+            body["tgtCcy"] = str(tgt_ccy)
+        if ccy:
+            body["ccy"] = str(ccy)
+
+        raw = await self._request_private("POST", "/trade/order", body=body)
+
+        items = raw.get("data") or []
+        if not items:
+            raise RuntimeError("OKX order: empty response data")
+
+        it0 = items[0] or {}
+        s_code = str(it0.get("sCode") or "")
+        s_msg = str(it0.get("sMsg") or "")
+
+        # OKX: code==0 может быть, но конкретно по ордеру sCode!=0
+        if s_code and s_code != "0":
+            raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
+
+        return {
+            "ordId": str(it0.get("ordId") or "0"),
+            "clOrdId": str(it0.get("clOrdId") or ""),
+            "sCode": s_code or "0",
+            "sMsg": s_msg,
+        }
+
     #REST: история сделок (fills-history) — исполнения за последние 3 месяца
     async def get_trades_history(
         self,

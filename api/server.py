@@ -27,13 +27,16 @@
 
 1. сейчас открытие=закрытие=open24h - скользящее окно 24 часа назад. можно использовать sodUtc0 - open дня по UTC0
 при этом low_price high_price можно только за сутки
+
+2. заявки (пока рыночная): SPOT: размер в базовой валюте (sz = amount_base). FUTURES/SWAP: размер в контрактах (sz = number_of_contracts)
+quantity у нас может быть float (в доках int)
 """
 
 
 import os
 import time
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from typing import List
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Header
+from typing import List, Optional
 import asyncio
 import datetime
 from fastapi.responses import JSONResponse
@@ -43,6 +46,17 @@ from adapters.okx_adapter import OkxAdapter
 from dotenv import load_dotenv
 load_dotenv()
 
+"""
+def _astras_error(request_guid: str | None, http_code: int, message: str, status_code: int | None = None):
+    return JSONResponse(
+        {
+            "requestGuid": request_guid or "",
+            "httpCode": int(http_code),
+            "message": str(message),
+        },
+        status_code=int(status_code if status_code is not None else http_code),
+    )
+"""
 
 def _make_adapter():
     name = os.getenv("ADAPTER", "okx").lower()
@@ -56,11 +70,9 @@ def _make_adapter():
 
     raise RuntimeError("Поддерживается только ADAPTER=okx")
 
-
 app = FastAPI(title="Astras Crypto Gateway")
 adapter = _make_adapter()
 
-# FOR ASTRAS
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,7 +96,6 @@ USER_SETTINGS: dict[str, str] = {}
 def add_token(payload: dict = Body(default={})):
     # Заглушка: Astras пытается “зарегистрировать” токен в observatory.
     return {"ok": True}
-#app = FastAPI()
 
 @app.get("/identity/v5/UserSettings")
 def user_settings(serviceName: str = Query(default="Astras"), key: str | None = None):
@@ -136,7 +147,7 @@ def all_portfolios(user_id: str):
     # Для DEV режима вернём один виртуальный портфель.
     return JSONResponse([
         {
-            "portfolio": "DEV",
+            "portfolio": "DEV_portfolio",
             "exchange": "OKX",
             "name": "DEV",
             "isDefault": True
@@ -152,8 +163,6 @@ def watchlist_collection(serviceName: str = Query(default="Astras")):
 def list_subscriptions():
     # Astras UI запрашивает список подписок observatory. В DEV режиме вернём пусто.
     return JSONResponse([])
-
-from fastapi import Request
 
 @app.post("/hyperion")
 async def hyperion(request: Request):
@@ -541,9 +550,16 @@ async def hyperion(request: Request):
                     break
 
         if raw is None:
-            raw = next(iter(_INSTR_CACHE.values()), None)
+            return JSONResponse(
+                {
+                    "requestGuid": "",
+                    "httpCode": 404,
+                    "message": f"Instrument '{sym}' not found on OKX",
+                },
+                status_code=404,
+            )
 
-        node = _make_node(raw) if raw else None
+        node = _make_node(raw)
 
         return JSONResponse({
             "data": {
@@ -581,72 +597,48 @@ async def hyperion(request: Request):
         }
     })
 
-# FOR ASTRAS
-
-
 def _astras_instrument_simple(d: dict) -> dict:
-    """
-    Преобразует нейтральный формат инструмента от адаптера в Astras md/v2/Securities.
-
-    Правила:
-    - ничего не придумываем
-    - если данных нет → None (в JSON это null)
-    - типы берём как есть из адаптера
-    """
-
-    symbol = d.get("symbol")
-    exchange = d.get("exchange")
-
-    inst_type = d.get("instType")
-    state = d.get("state")
-
-    lot_sz = d.get("lotSz")
-    tick_sz = d.get("tickSz")
-
-    quote_ccy = d.get("quoteCcy")
-
     return {
-        "symbol": symbol,
-        "shortname": symbol,
+        "symbol": d.get("symbol"),
+        "shortname": d.get("symbol"),
         "description": d.get("description"),
 
-        "exchange": exchange,
-        "market": inst_type,
+        "exchange": d.get("exchange"),
+        "market": d.get("instType"),
         "type": d.get("type"),
 
-        "lotsize": lot_sz,
+        "lotsize": d.get("lotSz"),
         "facevalue": d.get("facevalue"),
         "cfiCode": d.get("cfiCode"),
         "cancellation": d.get("cancellation"),
 
-        "minstep": tick_sz,
+        "minstep": d.get("tickSz"),
         "rating": d.get("rating"),
         "marginbuy": d.get("marginbuy"),
         "marginsell": d.get("marginsell"),
         "marginrate": d.get("marginrate"),
 
-        "pricestep": tick_sz,
+        "pricestep": d.get("tickSz"),
         "priceMax": d.get("priceMax"),
         "priceMin": d.get("priceMin"),
         "theorPrice": d.get("theorPrice"),
         "theorPriceLimit": d.get("theorPriceLimit"),
         "volatility": d.get("volatility"),
 
-        "currency": quote_ccy,
+        "currency": d.get("quoteCcy"),
         "ISIN": d.get("ISIN"),
         "yield": d.get("yield"),
 
-        "board": inst_type,
-        "primary_board": inst_type,
+        "board": d.get("instType"),
+        "primary_board": d.get("instType"),
 
         "tradingStatus": d.get("tradingStatus"),
-        "tradingStatusInfo": state,
+        "tradingStatusInfo": d.get("state"),
 
         "complexProductCategory": d.get("complexProductCategory"),
         "priceMultiplier": d.get("priceMultiplier"),
         "priceShownUnits": d.get("priceShownUnits"),
     }
-
 
 def _iso_from_unix_ms(ts_ms: int):
     if not ts_ms:
@@ -660,20 +652,13 @@ def _iso_from_unix_ms(ts_ms: int):
     except Exception:
         return None
 
-
 def _astras_order_simple_from_okx_neutral(
     o: dict,
     exchange: str,
     portfolio: str,
     existing: bool,
 ) -> dict:
-    # нормализация статуса OKX -> Astras
-    # схема:
-    # OKX live / partially_filled -> Astras working
-    # OKX filled -> Astras filled
-    # OKX canceled -> Astras canceled
-    # OKX rejected -> Astras rejected
-    # иначе "0"
+
     def _norm_order_status_okx_to_astras(st: str) -> str:
         s = (st or "").lower()
         if s in ("live", "partially_filled"):
@@ -686,11 +671,6 @@ def _astras_order_simple_from_okx_neutral(
             return "rejected"
         return "0"
 
-    # нормализация типа OKX -> Astras
-    # схема:
-    # OKX market* -> Astras market
-    # OKX limit* -> Astras limit
-    # иначе "0"
     def _norm_order_type_okx_to_astras(t: str) -> str:
         s = (t or "").lower()
         if s.startswith("market"):
@@ -699,13 +679,6 @@ def _astras_order_simple_from_okx_neutral(
             return "limit"
         return "0"
     
-    # нормализация tif OKX -> timeInForce Astras
-    # схема:
-    # OKX day -> Astras OneDay
-    # OKX ioc -> Astras ImmediateOrCancel
-    # OKX fok -> Astras FillOrKill
-    # OKX gtc -> Astras GoodTillCancelled
-    # иначе None
     def _norm_tif_okx_to_astras(tif: str):
         s = (tif or "").lower()
         if s == "day":
@@ -793,21 +766,57 @@ def _astras_order_simple_from_okx_neutral(
         "volume": volume,
     }
 
-
-# FOR ASTRAS
-from typing import Optional
-
-_INSTR_CACHE: dict[str, dict] = {}
-# Ключ: symbol (например, BTC-USDT)
-
-# Чтобы не дергать OKX на каждый GraphQL запрос (Astras шлет их пачкой)
-_INSTR_CACHE_TS: float = 0.0
+_INSTR_CACHE: dict[str, dict] = {} # Ключ: symbol (например, BTC-USDT)
+_INSTR_CACHE_TS: float = 0.0 # Чтобы не дергать OKX на каждый GraphQL запрос (Astras шлет их пачкой)
 _INSTR_LOCK = asyncio.Lock()
+_INSTR_TTL_SEC = 60.0 # TTL кешей (сек)
+SUPPORTED_BOARDS = ["SPOT", "FUTURES", "SWAP"]
+_ORDER_IDEMPOTENCY: dict[str, dict] = {} # Idempotency cache for market orders: X-REQID -> response json
 
+async def _load_ticker_map_for_types(inst_types: list[str]) -> dict[str, dict]:
+    # Грузим tickers для нужных instType и объединяем в symbol -> ticker
+    results = await asyncio.gather(
+        *(adapter.list_tickers(inst_type=it) for it in inst_types),
+        return_exceptions=True,
+    )
 
-# TTL кешей (сек)
-_INSTR_TTL_SEC = 60.0
+    merged: list[dict] = []
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        if r:
+            merged.extend(r)
 
+    return {t.get("symbol"): t for t in merged if t.get("symbol")}
+
+async def _astras_instruments_with_price_limits(
+    raw_items: list[dict],
+    instrumentGroup: str | None = None,
+) -> list[dict]:
+    # какие instType грузим в tickers
+    if instrumentGroup:
+        inst_types = [instrumentGroup]
+    else:
+        inst_types = ["SPOT", "FUTURES", "SWAP"]
+
+    ticker_map = await _load_ticker_map_for_types(inst_types)
+
+    out: list[dict] = []
+    for raw in raw_items:
+        x = _astras_instrument_simple(raw)
+
+        sym = raw.get("symbol")
+        t = ticker_map.get(sym) if sym else None
+
+        if t:
+            # priceMax/priceMin берём из тикера (24h high/low)
+            x["priceMax"] = t.get("high24h")
+            x["priceMin"] = t.get("low24h")
+
+        # если тикера нет — оставляем как было (None)
+        out.append(x)
+
+    return out
 
 async def _refresh_instr_cache():
     global _INSTR_CACHE, _INSTR_CACHE_TS
@@ -824,7 +833,6 @@ async def _refresh_instr_cache():
     _INSTR_CACHE = {x.get("symbol"): x for x in (raw_all or []) if x.get("symbol")}
     _INSTR_CACHE_TS = time.time()
 
-
 async def _ensure_instr_cache():
     if _INSTR_CACHE and (time.time() - _INSTR_CACHE_TS) < _INSTR_TTL_SEC:
         return
@@ -837,7 +845,6 @@ async def _ensure_instr_cache():
             await _refresh_instr_cache()
         except Exception:
             return
-
 
 async def _get_instr(symbol: str) -> Optional[dict]:
     if not _INSTR_CACHE:
@@ -943,28 +950,30 @@ async def md_quotes(broker_symbol: str):
 @app.get("/md/v2/Securities/{exchange}/{symbol}")
 async def md_security(exchange: str, symbol: str, instrumentGroup: str | None = None):
     # Гарантируем, что UI никогда не получит 404
+    symbol = symbol.replace("_", "-")
     if not _INSTR_CACHE:
         await _refresh_instr_cache()
-
     instr = _INSTR_CACHE.get(symbol)
 
-    # Если Astras запросил MOEX/IMOEX — отдаём любой реальный OKX-инструмент
     if instr is None:
-        instr = next(iter(_INSTR_CACHE.values()), None)
-
-    if instr is None:
-        raise HTTPException(status_code=404, detail="No instruments")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Instrument '{symbol}' not found on OKX"
+        )
 
     x = _astras_instrument_simple(instr)
+    try:
+        q = await adapter.get_quote_snapshot_rest(symbol=symbol)
+        x["priceMax"] = q.get("high24h")
+        x["priceMin"] = q.get("low24h")
+    except Exception:
+        pass
 
-    # Подменяем только routing-поля (это ожидает Astras)
-    #x["exchange"] = exchange
     if instrumentGroup:
         x["board"] = instrumentGroup
         x["primary_board"] = instrumentGroup
 
     return JSONResponse(x)
-
 
 @app.get("/md/v2/Securities/{exchange}")
 async def md_securities(
@@ -983,19 +992,13 @@ async def md_securities(
         items = [x for x in items if q in str(x.get("symbol", "")).upper()]
 
     items = items[: max(1, min(limit, 1000))]
-
-    out: list[dict] = []
-    for raw in items:
-        x = _astras_instrument_simple(raw)
-        #x["exchange"] = exchange
-        if instrumentGroup:
+    out = await _astras_instruments_with_price_limits(items, instrumentGroup)
+    if instrumentGroup:
+        for x in out:
             x["board"] = instrumentGroup
             x["primary_board"] = instrumentGroup
-        out.append(x)
 
     return JSONResponse(out)
-
-SUPPORTED_BOARDS = ["SPOT", "FUTURES", "SWAP"]
 
 @app.get("/md/v2/Securities/{exchange}/{symbol}/availableBoards")
 async def md_security_available_boards(
@@ -1015,8 +1018,6 @@ async def instruments_treemap(market: str | None = None, limit: int = 50):
 
     items = list(_INSTR_CACHE.values())
     items = items[: max(1, min(limit, 1000))]
-
-    # Astras ожидает массив объектов инструментов
     out = []
     for raw in items:
         x = _astras_instrument_simple(raw)
@@ -1121,7 +1122,6 @@ async def md_securities_root(
         items = [x for x in items if q in x.get("symbol", "").upper()]
 
     items = items[: max(1, min(limit, 1000))]
-
     out = []
     for raw in items:
         x = _astras_instrument_simple(raw)
@@ -1129,26 +1129,81 @@ async def md_securities_root(
         if instrumentGroup:
             x["board"] = instrumentGroup
             x["primary_board"] = instrumentGroup
-
         out.append(x)
 
     return JSONResponse(out)
-
-# FOR ASTRAS
 
 @app.get("/md/v2/time")
 def md_time():
     return int(time.time())
 
-# все торговые инструменты
-@app.get("/v2/instruments")
-async def get_instruments(exchange: str = "OKX", format: str = "Simple", token: str = None):
+@app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/market")
+async def cmd_market_order(
+    request: Request,
+    x_reqid: str = Header(..., alias="X-REQID"),
+):
+    body = await request.json()
 
-#    if not token:
-#        raise HTTPException(400, detail="TokenRequired")
-    await _ensure_instr_cache()
-    return [_astras_instrument_simple(x) for x in list(_INSTR_CACHE.values())]
+    if x_reqid in _ORDER_IDEMPOTENCY:
+        old_body = _ORDER_IDEMPOTENCY[x_reqid]
+        return JSONResponse(
+            {
+                "message": "Request with such X-REQID was already handled.",
+                "oldResponse": {
+                    "statusCode": 200,
+                    "body": old_body
+                }
+            },
+            status_code=400
+        )
 
+    side = (body.get("side") or "").lower()
+    qty = body.get("quantity")
+    instr = body.get("instrument") or {}
+
+    symbol = instr.get("symbol")
+    inst_type = instr.get("instrumentGroup") or instr.get("board")
+
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="Invalid side")
+    if symbol is None or str(symbol).strip() == "":
+        raise HTTPException(status_code=400, detail="Instrument symbol is required")
+    if qty is None:
+        raise HTTPException(status_code=400, detail="quantity is required")
+    
+    try:
+        qty_f = float(qty)
+    except Exception:
+        raise HTTPException(status_code=400, detail="quantity must be number")
+
+    inst_type_s = str(inst_type or "SPOT").upper()
+    if inst_type_s not in ("SPOT", "FUTURES", "SWAP"):
+        raise HTTPException(status_code=400, detail="Unsupported instrumentGroup/board")
+
+    # SPOT: размер в базовой валюте (для BUY нужно tgtCcy="base_ccy")
+    tgt_ccy = None
+    if inst_type_s == "SPOT" and side == "buy":
+        tgt_ccy = "base_ccy"
+
+    try:
+        res = await adapter.place_market_order(
+            symbol=symbol,
+            side=side,
+            quantity=qty_f,
+            inst_type=inst_type_s,
+            tgt_ccy=tgt_ccy,
+            cl_ord_id=x_reqid,
+        )
+    except Exception as e:
+        return JSONResponse({"message": str(e)}, status_code=502)
+
+    out = {
+        "message": "success",
+        "orderNumber": str(res.get("ordId") or "0"),
+    }
+
+    _ORDER_IDEMPOTENCY[x_reqid] = out
+    return JSONResponse(out)
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
@@ -1433,7 +1488,6 @@ async def stream(ws: WebSocket):
 
                 continue
 
-
             # все заявки по портфелю (история + подписка) в Astras Simple
             if opcode == "OrdersGetAndSubscribeV2":
                 stop = asyncio.Event()
@@ -1653,11 +1707,6 @@ async def stream(ws: WebSocket):
                     subscribed_evt = asyncio.Event()
                     error_evt = asyncio.Event()
 
-                    # Пока отправляется ACK, лайв события в буфер
-                    # чтобы порядок был: ACK(200)  live
-                    history_done = False
-                    live_buffer: list[dict] = []
-
                     def _on_subscribed(_ev: dict):
                         subscribed_evt.set()
 
@@ -1666,18 +1715,11 @@ async def stream(ws: WebSocket):
                         error_evt.set()
                         return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
-                    async def _on_live_book(b: dict, _guid: str):
-                        nonlocal history_done
-                        if not history_done:
-                            live_buffer.append(b)
-                            return
-                        await on_book(b, _guid)
-
                     asyncio.create_task(
                         adapter.subscribe_order_book(
                             symbol=code,
                             depth=depth,
-                            on_data=lambda b, _g=sub_guid: asyncio.create_task(_on_live_book(b, _g)),
+                            on_data=lambda b, _g=sub_guid: asyncio.create_task(on_book(b, _g)),
                             stop_event=stop,
                             on_subscribed=_on_subscribed,
                             on_error=_on_error,
@@ -1701,15 +1743,6 @@ async def stream(ws: WebSocket):
 
                     # Подписка подтверждена, отправляем ACK 200
                     await send_ack_200(sub_guid)
-
-                    # live-данные
-                    history_done = True
-
-                    # Сначала то, что успело прийти в буфер
-                    if live_buffer:
-                        for b in live_buffer:
-                            await on_book(b, sub_guid)
-                        live_buffer.clear()
 
                 continue
 
@@ -2089,7 +2122,6 @@ async def stream(ws: WebSocket):
                     )
                 )
                 continue"""
-
 
     except WebSocketDisconnect:
         pass
