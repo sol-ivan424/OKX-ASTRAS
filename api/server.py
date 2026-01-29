@@ -25,11 +25,15 @@
 4. документация для карты рынка
 5. размер и структура файлов
 
+0. пинг у нас - загрушка. в okx пинга нет
 1. сейчас открытие=закрытие=open24h - скользящее окно 24 часа назад. можно использовать sodUtc0 - open дня по UTC0
 при этом low_price high_price можно только за сутки
-
 2. заявки (пока рыночная): SPOT: размер в базовой валюте (sz = amount_base). FUTURES/SWAP: размер в контрактах (sz = number_of_contracts)
 quantity у нас может быть float (в доках int)
+3. лимитная заявка пока без айсбергов
+4. oneday лимитных заявок нет. ставится обычная limit как goodtillcancelled
+attheclose - отклоняется, так как нет закрытия торгов. 
+5. стоп-заявка реализована как условная. okx сама хранит заявку
 """
 
 
@@ -767,11 +771,13 @@ def _astras_order_simple_from_okx_neutral(
     }
 
 _INSTR_CACHE: dict[str, dict] = {} # Ключ: symbol (например, BTC-USDT)
-_INSTR_CACHE_TS: float = 0.0 # Чтобы не дергать OKX на каждый GraphQL запрос (Astras шлет их пачкой)
+_INSTR_CACHE_TS: float = 0.0 # Чтобы не дергать OKX на каждый GraphQL запрос
 _INSTR_LOCK = asyncio.Lock()
 _INSTR_TTL_SEC = 60.0 # TTL кешей (сек)
 SUPPORTED_BOARDS = ["SPOT", "FUTURES", "SWAP"]
-_ORDER_IDEMPOTENCY: dict[str, dict] = {} # Idempotency cache for market orders: X-REQID -> response json
+_ORDER_IDEMPOTENCY: dict[str, dict] = {} # cache for market orders: X-REQID -> response json
+_ORDER_IDEMPOTENCY_LIMIT: dict[str, dict] = {} # limit
+_ORDER_IDEMPOTENCY_STOP: dict[str, dict] = {} # stop
 
 async def _load_ticker_map_for_types(inst_types: list[str]) -> dict[str, dict]:
     # Грузим tickers для нужных instType и объединяем в symbol -> ticker
@@ -1170,19 +1176,17 @@ async def cmd_market_order(
         raise HTTPException(status_code=400, detail="Instrument symbol is required")
     if qty is None:
         raise HTTPException(status_code=400, detail="quantity is required")
-    
     try:
         qty_f = float(qty)
     except Exception:
         raise HTTPException(status_code=400, detail="quantity must be number")
-
-    inst_type_s = str(inst_type or "SPOT").upper()
+    if inst_type is None or str(inst_type).strip() == "":
+        raise HTTPException(status_code=400, detail="instrumentGroup/board is required")
+    inst_type_s = str(inst_type).strip().upper()
     if inst_type_s not in ("SPOT", "FUTURES", "SWAP"):
         raise HTTPException(status_code=400, detail="Unsupported instrumentGroup/board")
-
-    # SPOT: размер в базовой валюте (для BUY нужно tgtCcy="base_ccy")
     tgt_ccy = None
-    if inst_type_s == "SPOT" and side == "buy":
+    if inst_type_s == "SPOT" and side == "buy": # SPOT: размер в базовой валюте (для BUY нужно tgtCcy="base_ccy")
         tgt_ccy = "base_ccy"
 
     try:
@@ -1204,6 +1208,182 @@ async def cmd_market_order(
 
     _ORDER_IDEMPOTENCY[x_reqid] = out
     return JSONResponse(out)
+
+@app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/limit")
+async def cmd_limit_order(
+    request: Request,
+    x_reqid: str = Header(..., alias="X-REQID"),
+):
+    body = await request.json()
+
+    if x_reqid in _ORDER_IDEMPOTENCY_LIMIT:
+        old_body = _ORDER_IDEMPOTENCY_LIMIT[x_reqid]
+        return JSONResponse(
+            {
+                "message": "Request with such X-REQID was already handled.",
+                "oldResponse": {
+                    "statusCode": 200,
+                    "body": old_body
+                }
+            },
+            status_code=400
+        )
+
+    side = (body.get("side") or "").lower()
+    qty = body.get("quantity")
+    price = body.get("price")
+    instr = body.get("instrument") or {}
+
+    symbol = instr.get("symbol")
+    inst_type = instr.get("instrumentGroup") or instr.get("board")
+
+    # валидация (по аналогии с market, но +price)
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="Invalid side. Allowed values: buy, sell")
+    if symbol is None or str(symbol).strip() == "":
+        raise HTTPException(status_code=400, detail="Instrument symbol is required")
+    if qty is None:
+        raise HTTPException(status_code=400, detail="quantity is required")
+    if price is None:
+        raise HTTPException(status_code=400, detail="price is required")
+    try:
+        qty_f = float(qty)
+    except Exception:
+        raise HTTPException(status_code=400, detail="quantity must be number")
+    try:
+        price_f = float(price)
+    except Exception:
+        raise HTTPException(status_code=400, detail="price must be number")
+    if inst_type is None or str(inst_type).strip() == "":
+        raise HTTPException(status_code=400, detail="instrumentGroup/board is required")
+    inst_type_s = str(inst_type).strip().upper()
+    if inst_type_s not in ("SPOT", "FUTURES", "SWAP"):
+        raise HTTPException(status_code=400, detail="Unsupported instrumentGroup/board")   
+    
+    tif = (body.get("timeInForce") or "oneday").lower()
+    if tif in ("oneday", "goodtillcancelled"):
+        okx_ord_type = "limit"
+    elif tif == "immediateorcancel":
+        okx_ord_type = "ioc"
+    elif tif == "fillorkill":
+        okx_ord_type = "fok"
+    elif tif == "bookorcancel":
+        okx_ord_type = "post_only"
+    elif tif == "attheclose":
+        raise HTTPException(status_code=400, detail="timeInForce attheclose is not supported for OKX")
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported timeInForce: {tif}")
+
+    try:
+        res = await adapter.place_limit_order(
+            symbol=symbol,
+            side=side,
+            quantity=qty_f,
+            price=price_f,
+            inst_type=inst_type_s,
+            ord_type=okx_ord_type,
+            cl_ord_id=x_reqid,  # как и в market
+        )
+    except Exception as e:
+        return JSONResponse({"message": str(e)}, status_code=502)
+
+    out = {
+        "message": "success",
+        "orderNumber": str(res.get("ordId") or "0"),
+    }
+
+    _ORDER_IDEMPOTENCY_LIMIT[x_reqid] = out
+    return JSONResponse(out)
+
+@app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/stop")
+async def create_stop_order(request: Request):
+
+    body = await request.json()
+    x_reqid = request.headers.get("X-REQID")
+    if not x_reqid:
+        raise HTTPException(status_code=400, detail="X-REQID header is required")
+    if x_reqid in _ORDER_IDEMPOTENCY_STOP:
+        old_body = _ORDER_IDEMPOTENCY_STOP[x_reqid]
+        return JSONResponse(
+            {
+                "message": "Request with such X-REQID was already handled.",
+                "oldResponse": {
+                    "statusCode": 200,
+                    "body": old_body
+                }
+            },
+            status_code=400
+        )
+
+    side = body.get("side")
+    condition = body.get("condition")
+    trigger_price = body.get("triggerPrice")
+    qty = body.get("quantity")
+    instrument = body.get("instrument") or {}
+    allow_margin = bool(body.get("allowMargin", False))
+
+    symbol = instrument.get("symbol")
+    inst_type = instrument.get("instrumentGroup") or instrument.get("board")
+    inst_type_s = str(inst_type).strip().upper()
+
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="Invalid side")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Instrument symbol is required")
+    
+    if trigger_price is None:
+        raise HTTPException(status_code=400, detail="triggerPrice is required")
+    try:
+        trigger_price_f = float(trigger_price)
+    except Exception:
+        raise HTTPException(status_code=400, detail="triggerPrice must be number")
+    if trigger_price_f <= 0:
+        raise HTTPException(status_code=400, detail="triggerPrice must be > 0")
+    
+    if qty is None:
+        raise HTTPException(status_code=400, detail="quantity is required")
+    try:
+        qty_f = float(qty)
+    except Exception:
+        raise HTTPException(status_code=400, detail="quantity must be number")
+    if qty_f <= 0:
+        raise HTTPException(status_code=400, detail="quantity must be > 0")
+    if inst_type_s not in ("SPOT", "FUTURES", "SWAP"):
+            raise HTTPException(status_code=400, detail="Unsupported instrumentGroup/boar")
+
+    allowed = ("more", "less", "moreorequal", "lessorequal")
+    if condition not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid condition. Allowed values: {', '.join(allowed)}")
+    if side == "buy" and condition not in ("more", "moreorequal"):
+        raise HTTPException(status_code=400, detail="For side=buy condition must be more/moreorequal")
+    if side == "sell" and condition not in ("less", "lessorequal"):
+        raise HTTPException(status_code=400, detail="For side=sell condition must be less/lessorequal")
+
+    td_mode = "cross" if allow_margin else "cash"
+
+    # OKX не различает more / >= и less / <=
+    trigger_px_type = "last"
+
+    try:
+        res = await adapter.place_stop_market_order(
+            inst_id=symbol,
+            inst_type=inst_type_s,
+            side=side,
+            sz=str(qty),
+            trigger_px=str(trigger_price),
+            trigger_px_type=trigger_px_type,
+            td_mode=td_mode,
+            algo_cl_ord_id=x_reqid,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    out = {
+        "message": "success",
+        "orderNumber": res.get("algoId") or res.get("orderId"),
+    }
+    _ORDER_IDEMPOTENCY_STOP[x_reqid] = out
+    return out
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
@@ -2072,7 +2252,7 @@ async def stream(ws: WebSocket):
                 # нужно добавить
 
             # все позиции портфеля
-            """if opcode == "PositionsGetAndSubscribeV2":
+            if opcode == "PositionsGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["positions"].append(stop)
 
@@ -2121,7 +2301,7 @@ async def stream(ws: WebSocket):
                         stop,
                     )
                 )
-                continue"""
+                continue
 
     except WebSocketDisconnect:
         pass

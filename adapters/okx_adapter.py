@@ -874,7 +874,8 @@ class OkxAdapter:
         pos_side: Optional[str] = None,
         tgt_ccy: Optional[str] = None,
         cl_ord_id: Optional[str] = None,
-        ccy: Optional[str] = None, 
+        ccy: Optional[str] = None,
+        tif: Optional[str] = None 
     ) -> Dict[str, Any]:
         """ 
         Выставляет рыночную заявку через OKX REST: POST /api/v5/trade/order
@@ -923,6 +924,8 @@ class OkxAdapter:
             body["tgtCcy"] = str(tgt_ccy)
         if ccy:
             body["ccy"] = str(ccy)
+        if tif:
+            body["tif"] = str(tif)
 
         raw = await self._request_private("POST", "/trade/order", body=body)
 
@@ -941,6 +944,204 @@ class OkxAdapter:
         return {
             "ordId": str(it0.get("ordId") or "0"),
             "clOrdId": str(it0.get("clOrdId") or ""),
+            "sCode": s_code or "0",
+            "sMsg": s_msg,
+        }
+
+
+    #REST: выставление лимитной заявки (limit order)
+    async def place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        inst_type: str = "SPOT",
+        td_mode: Optional[str] = None,
+        pos_side: Optional[str] = None,
+        ord_type: Optional[str] = None,
+        cl_ord_id: Optional[str] = None,
+        ccy: Optional[str] = None,
+        tif: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Выставляет лимитную заявку через OKX REST: POST /api/v5/trade/order
+
+        По документации OKX для лимитной заявки нужны:
+        - instId, tdMode, side, ordType, sz, px
+
+        ordType (OKX):
+        - limit (обычная лимитная)
+        - post_only (пассивная, Maker-only)
+        - ioc (Immediate-or-cancel)
+        - fok (Fill-or-kill)
+
+        Возвращает нейтральный результат:
+        {
+          "ordId": "...",
+          "clOrdId": "...",
+          "sCode": "0",
+          "sMsg": ""
+        }
+        """
+
+        inst_id = symbol
+        side_s = str(side or "").lower().strip()
+        if side_s not in ("buy", "sell"):
+            raise ValueError("side must be 'buy' or 'sell'")
+
+        def _fmt_sz(x: float) -> str:
+            s = f"{x:.16f}".rstrip("0").rstrip(".")
+            return s if s else "0"
+
+        def _fmt_px(x: float) -> str:
+            s = f"{x:.16f}".rstrip("0").rstrip(".")
+            return s if s else "0"
+
+        # tdMode: SPOT без маржи -> cash, деривативы/маржа -> cross/isolated
+        if td_mode is None:
+            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
+
+        # ordType по умолчанию для лимитной заявки
+        ord_type_s = (ord_type or "limit").lower().strip()
+        if ord_type_s not in ("limit", "post_only", "ioc", "fok"):
+            raise ValueError("ord_type must be one of: limit, post_only, ioc, fok")
+
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side_s,
+            "ordType": ord_type_s,
+            "sz": _fmt_sz(quantity),
+            "px": _fmt_px(price),
+        }
+        if cl_ord_id:
+            body["clOrdId"] = str(cl_ord_id)
+        if pos_side:
+            body["posSide"] = str(pos_side)
+        if ccy:
+            body["ccy"] = str(ccy)
+        if tif:
+            body["tif"] = str(tif)
+
+        raw = await self._request_private("POST", "/trade/order", body=body)
+
+        items = raw.get("data") or []
+        if not items:
+            raise RuntimeError("OKX order: empty response data")
+
+        it0 = items[0] or {}
+        s_code = str(it0.get("sCode") or "")
+        s_msg = str(it0.get("sMsg") or "")
+
+        # OKX: code==0 может быть, но конкретно по ордеру sCode!=0
+        if s_code and s_code != "0":
+            raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
+
+        return {
+            "ordId": str(it0.get("ordId") or "0"),
+            "clOrdId": str(it0.get("clOrdId") or ""),
+            "sCode": s_code or "0",
+            "sMsg": s_msg,
+        }
+
+    #REST: выставление стоп-заявки (conditional / algo order)
+    async def place_stop_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        trigger_price: float,
+        inst_type: str = "SPOT",
+        td_mode: Optional[str] = None,
+        pos_side: Optional[str] = None,
+        trigger_px_type: Optional[str] = None,
+        cl_ord_id: Optional[str] = None,
+        ccy: Optional[str] = None,
+        tgt_ccy: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Выставляет стоп-заявку через OKX REST conditional/algo ордер:
+        POST /api/v5/trade/order-algo
+
+        Мы делаем STOP-MARKET (после триггера исполняется по рынку):
+        - ordType = "conditional"
+        - triggerPx = условная цена
+        - triggerPxType = тип цены для сравнения (по умолчанию "last")
+        - orderPx = "-1"  (для market исполнения после триггера)
+
+        Минимально необходимые параметры по документации OKX:
+        - instId, tdMode, side, ordType, sz, triggerPx, triggerPxType, orderPx
+
+        Дополнительно:
+        - posSide: требуется для деривативов в hedge (long/short) режиме
+        - algoClOrdId: клиентский id для algo-ордера (можно использовать X-REQID)
+        - ccy: валюта списания (опционально)
+        - tgtCcy: для SPOT может потребоваться в некоторых режимах (опционально; если OKX не поддержит — вернёт ошибку)
+
+        Возвращает нейтральный результат:
+        {
+          "algoId": "...",
+          "algoClOrdId": "...",
+          "sCode": "0",
+          "sMsg": ""
+        }
+        """
+
+        inst_id = symbol
+        side_s = str(side or "").lower().strip()
+        if side_s not in ("buy", "sell"):
+            raise ValueError("side must be 'buy' or 'sell'")
+
+        def _fmt_num(x: float) -> str:
+            s = f"{x:.16f}".rstrip("0").rstrip(".")
+            return s if s else "0"
+
+        # tdMode: SPOT без маржи -> cash, деривативы/маржа -> cross/isolated
+        if td_mode is None:
+            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
+
+        # triggerPxType: last / index / mark (по документации OKX)
+        tpx_type = (trigger_px_type or "last").lower().strip()
+        if tpx_type not in ("last", "index", "mark"):
+            raise ValueError("trigger_px_type must be one of: last, index, mark")
+
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side_s,
+            "ordType": "conditional",
+            "sz": _fmt_num(quantity),
+            "triggerPx": _fmt_num(trigger_price),
+            "triggerPxType": tpx_type,
+            # ordPx = -1 => market order after trigger
+            "ordePx": "-1",
+        }
+        if pos_side:
+            body["posSide"] = str(pos_side)
+        if cl_ord_id:
+            body["algoClOrdId"] = str(cl_ord_id)
+        if ccy:
+            body["ccy"] = str(ccy)
+        if tgt_ccy:
+            body["tgtCcy"] = str(tgt_ccy)
+
+        raw = await self._request_private("POST", "/trade/order-algo", body=body)
+
+        items = raw.get("data") or []
+        if not items:
+            raise RuntimeError("OKX stop/algo order: empty response data")
+
+        it0 = items[0] or {}
+        s_code = str(it0.get("sCode") or "")
+        s_msg = str(it0.get("sMsg") or "")
+
+        if s_code and s_code != "0":
+            raise RuntimeError(f"OKX stop/algo order error {s_code}: {s_msg}")
+
+        return {
+            "algoId": str(it0.get("algoId") or "0"),
+            "algoClOrdId": str(it0.get("algoClOrdId") or ""),
             "sCode": s_code or "0",
             "sMsg": s_msg,
         }
