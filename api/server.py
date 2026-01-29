@@ -2112,31 +2112,30 @@ async def stream(ws: WebSocket):
                 stop = asyncio.Event()
                 active["fills"].append(stop)
 
-                portfolio = msg.get("portfolio")  #адаптер игнорирует (в OKX нет такого понятия)
-                exchange_in = msg.get("exchange")  #адаптер игнорирует
-                data_format = msg.get("format")  #адаптер игнорирует
-
+                portfolio = msg.get("portfolio")  # у OKX виртуальный
+                exchange_out = "OKX"
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
 
-                # если Astras переиспользовал guid — остановим старую подписку с этим guid
+                # если Astras переиспользовал guid — остановим старую подписку
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
 
                 subs[sub_guid] = stop
-                exchange_out = "OKX"
 
                 async def send_trade_astras(t: dict, existing_flag: bool, _guid: str):
                     ts_ms = int(t.get("ts", 0) or 0)
                     date_iso = _iso_from_unix_ms(ts_ms) if ts_ms else None
 
                     symbol = t.get("symbol") or "N/A"
+                    qty = float(t.get("qty", 0) or 0)
+                    price = float(t.get("price", 0) or 0)
 
                     payload = {
                         "id": str(t.get("id", "0")),
                         "orderno": str(t.get("orderno", "0")),
-                        "comment": None,  # comment всегда null
+                        "comment": None,
 
                         "symbol": symbol,
                         "brokerSymbol": f"{exchange_out}:{symbol}",
@@ -2145,41 +2144,32 @@ async def stream(ws: WebSocket):
                         "date": date_iso,
                         "board": None,  # у OKX нет board
 
-                        # qtyUnits: float
-                        "qtyUnits": t.get("qtyUnits", 0) or 0,
-
-                        # qtyBatch: лотов у OKX нет
+                        # Astras Simple
+                        "qtyUnits": qty,
                         "qtyBatch": 0,
+                        "qty": qty,
 
-                        # qty: "Количество" по Astras -> используем qtyUnits (fill size), как float
-                        "qty": t.get("qty", 0) or 0,
-
-                        "price": t.get("price", 0) or 0,
+                        "price": price,
                         "accruedInt": 0,
 
-                        "side": t.get("side", "0") or "0",
+                        "side": t.get("side", "0"),
 
-                        # existing: True для истории (snapshot), False для онлайна
                         "existing": bool(existing_flag),
 
-                        # комиссия: abs(fee) уже нормализована в адаптере
                         "commission": t.get("commission", 0) or 0,
-
                         "repoSpecificFields": None,
 
-                        # volume/value: price * qtyUnits (посчитано в адаптере)
+                        # volume / value = price * qty
                         "volume": t.get("volume", 0) or 0,
-                        "value": t.get("value", 0) or 0,
+                        "value": 0,
                     }
 
                     await safe_send_json({"data": payload, "guid": _guid})
 
-                # Сначала запускается подписка и ждём подтверждение/ошибку от OKX
+                # события подписки OKX
                 subscribed_evt = asyncio.Event()
                 error_evt = asyncio.Event()
 
-                # Пока отправляется историю, лайв события в буфер
-                # чтобы порядок был: ACK(200)  история  live
                 history_done = False
                 live_buffer: list[dict] = []
 
@@ -2187,7 +2177,6 @@ async def stream(ws: WebSocket):
                     subscribed_evt.set()
 
                 def _on_error(ev: dict):
-                    # OKX event:error -> Astras error (реальный code/msg) + close WS
                     error_evt.set()
                     return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
@@ -2196,7 +2185,7 @@ async def stream(ws: WebSocket):
                     if not history_done:
                         live_buffer.append(tr)
                         return
-                    await send_trade_astras(tr, False, _guid)  # existing=False — новые события (OKX WS)
+                    await send_trade_astras(tr, False, _guid)
 
                 asyncio.create_task(
                     adapter.subscribe_trades(
@@ -2208,7 +2197,6 @@ async def stream(ws: WebSocket):
                     )
                 )
 
-                # Ждём либо subscribe, либо error (без таймаута)
                 done, pending = await asyncio.wait(
                     [
                         asyncio.create_task(subscribed_evt.wait()),
@@ -2219,26 +2207,24 @@ async def stream(ws: WebSocket):
                 for t in pending:
                     t.cancel()
 
-                # Если была ошибка, _handle_okx_ws_error уже отправил ответ и закрыл WS
                 if error_evt.is_set():
                     raise WebSocketDisconnect
 
-                # Подписка подтверждена, отправляем ACK 200
+                # ACK
                 await send_ack_200(sub_guid)
 
-                # история (если skipHistory == false)
+                # история сделок (REST)
                 if (not skip_history) and hasattr(adapter, "get_trades_history"):
                     try:
                         history = await adapter.get_trades_history(inst_type=inst_type, limit=100)
                         for tr in history:
-                            await send_trade_astras(tr, True, sub_guid)  # existing=True — данные из снепшота/истории (REST)
+                            await send_trade_astras(tr, True, sub_guid)
                     except Exception:
                         pass
 
-                # live-данные
                 history_done = True
 
-                # Сначала то, что успело прийти в буфер
+                # буфер
                 if live_buffer:
                     for tr in live_buffer:
                         await send_trade_astras(tr, False, sub_guid)

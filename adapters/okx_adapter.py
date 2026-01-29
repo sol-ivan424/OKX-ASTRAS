@@ -790,7 +790,12 @@ class OkxAdapter:
         }
 
     #парсер сделки OKX (fills) из REST и WS orders в нейтральный формат
-    def _parse_okx_trade_any(self, d: Dict[str, Any], is_history: bool) -> Dict[str, Any]:
+    def _parse_okx_trade_any(
+        self,
+        d: Dict[str, Any],
+        is_history: bool,
+        inst_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Нейтральный формат сделки (исполнения):
         id, orderno, comment, symbol, side, price, qty_units, qty, ts(ms), commission, fee_ccy, is_history
@@ -823,11 +828,26 @@ class OkxAdapter:
         value = fill_px * fill_sz
         volume = value
 
+        # exchange/instType полезны для маппинга в Astras (board/instrumentGroup)
+        inst_type_s = str(inst_type or d.get("instType") or "").upper() or None
+
+        # date в ISO 8601 UTC (как ждёт Astras): 2023-12-29T12:35:06.0000000Z
+        date_iso = None
+        if ts_ms and ts_ms > 0:
+            try:
+                dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+                date_iso = dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+            except Exception:
+                date_iso = None
+
         return {
             "id": str(trade_id),
             "orderno": str(ord_id),
             "comment": None,
             "symbol": inst_id,
+            "exchange": "OKX",
+            "instType": inst_type_s,
+            "date": date_iso,
             "side": side,
             "price": fill_px,
             "qtyUnits": fill_sz,     # float
@@ -947,7 +967,6 @@ class OkxAdapter:
             "sCode": s_code or "0",
             "sMsg": s_msg,
         }
-
 
     #REST: выставление лимитной заявки (limit order)
     async def place_limit_order(
@@ -1115,7 +1134,7 @@ class OkxAdapter:
             "triggerPx": _fmt_num(trigger_price),
             "triggerPxType": tpx_type,
             # ordPx = -1 => market order after trigger
-            "ordePx": "-1",
+            "orderPx": "-1",
         }
         if pos_side:
             body["posSide"] = str(pos_side)
@@ -1163,7 +1182,7 @@ class OkxAdapter:
 
         out: List[Dict[str, Any]] = []
         for item in raw.get("data", []):
-            out.append(self._parse_okx_trade_any(item, is_history=True))
+            out.append(self._parse_okx_trade_any(item, is_history=True, inst_type=inst_type))
         return out
 
     #WS: подписка на изменения заявок (private channel orders)
@@ -1285,7 +1304,8 @@ class OkxAdapter:
         Поле existing формируется в server.py, здесь есть флаг is_history=False.
         """
         login_msg = self._ws_login_payload()
-
+        inst_type = str(inst_type).upper()
+        assert inst_type in ("SPOT","SWAP","FUTURES")
         sub_args: Dict[str, Any] = {"channel": "orders", "instType": inst_type}
         sub_msg = {"op": "subscribe", "args": [sub_args]}
 
@@ -1367,7 +1387,7 @@ class OkxAdapter:
                             if fill_sz <= 0:
                                 continue
 
-                            trade = self._parse_okx_trade_any(item, is_history=False)
+                            trade = self._parse_okx_trade_any(item, is_history=False, inst_type=inst_type)
                             res = on_data(trade)
                             if asyncio.iscoroutine(res):
                                 await res
