@@ -31,6 +31,7 @@ async def test_okx_private_ws_trades_subscribe():
         "opcode": "TradesGetAndSubscribeV2",
         "exchange": "OKX",
         "portfolio": "DEV_portfolio",
+        "instrumentGroup": "SPOT",
         "skipHistory": True,
         "format": "Simple",
         "guid": guid,

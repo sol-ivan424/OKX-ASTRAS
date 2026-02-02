@@ -1400,10 +1400,10 @@ async def stream(ws: WebSocket):
         except Exception:
             return
 
-    await safe_send_json({
+    """await safe_send_json({
         "message": "Connected",
         "httpCode": 200,
-    })
+    })"""
 
     active: dict[str, list[asyncio.Event]] = {
         "instruments": [],   # пока не используются в opcode
@@ -1490,12 +1490,17 @@ async def stream(ws: WebSocket):
             inst_type = msg.get("instrumentGroup") or msg.get("board")
 
             if opcode == "ping":
+                ping_guid = msg["guid"]
+
+                ev = subs.get(ping_guid)
+                is_alive = ev is not None and not ev.is_set()
+
                 await safe_send_json({
                     "opcode": "ping",
-                    "guid": req_guid,
-                    "confirm": True
+                    "guid": ping_guid,
+                    "confirm": is_alive,
                 })
-                continue           
+                continue      
 
             # Astras просит отписаться от подписки по guid
             if opcode == "unsubscribe":
@@ -2232,62 +2237,108 @@ async def stream(ws: WebSocket):
 
                 continue
             
-
-            # все сделки по инструменту
-            """if opcode == "AllTradesGetAndSubscribe":"""
-                # нужно добавить
-
-            # все позиции портфеля
+            # текущие позиции по инструментам и деньгам (Astras Simple)
             if opcode == "PositionsGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["positions"].append(stop)
 
-                exchange = msg.get("exchange")
-                portfolio = msg.get("portfolio")
-                guid = msg.get("guid") or req_guid
-                subs[guid] = stop
-                _skip_history = msg.get("skipHistory", False)
+                exchange_out = "OKX"
+                portfolio = msg.get("portfolio") or "0"
+                skip_history = bool(msg.get("skipHistory", False))
+                sub_guid = msg.get("guid") or req_guid
 
-                async def on_pos_opcode(pos):
-                    qty = pos.qty or 0.0
-                    px = pos.avgPrice or 0.0
-                    volume = round(qty * px, 6)
+                inst_type = msg.get("instrumentGroup") or msg.get("board")
+                inst_type_s = str(inst_type).strip().upper() if inst_type else None
+
+                # если Astras переиспользовал guid — остановим старую подписку
+                old = subs.pop(sub_guid, None)
+                if old:
+                    old.set()
+                subs[sub_guid] = stop
+
+                async def send_pos_astras(p: dict, existing_flag: bool, _guid: str):
+                    symbol = p.get("symbol")
+
+                    qty_units = float(p.get("qtyUnits", 0) or 0)
+                    avg_price = float(p.get("avgPrice", 0) or 0)
+                    cur_price = p.get("currentPrice")
+                    cur_price = float(cur_price) if cur_price is not None else 0.0
+
+                    volume = p.get("volume")
+                    current_volume = p.get("currentVolume")
+                    volume = float(volume) if volume is not None else (avg_price * qty_units)
+                    current_volume = float(current_volume) if current_volume is not None else (cur_price * qty_units)
 
                     payload = {
-                        "v": volume,
-                        "cv": volume,
-                        "sym": pos.symbol,
-                        "tic": f"{exchange}:{pos.symbol}",
-                        "p": portfolio,
-                        "ex": exchange,
+                        "volume": volume,
+                        "currentVolume": current_volume,
 
-                        "pxavg": px,
-                        "q": qty,
-                        "o": qty,
-                        "lot": 1,
-                        "n": pos.symbol,
+                        "symbol": symbol,
+                        "brokerSymbol": symbol,
+                        "portfolio": portfolio,
+                        "exchange": exchange_out,
 
-                        "q0": qty,
-                        "q1": qty,
-                        "q2": qty,
-                        "qf": qty,
+                        "avgPrice": avg_price,
 
-                        "upd": 0.0,
-                        "up": pos.pnl or 0.0,
-                        "cur": False,
-                        "h": True,
+                        "qtyUnits": qty_units,
+                        "openUnits": 0,
+                        "lotSize": float(p.get("lotSize", 0) or 0),
+                        "shortName": p.get("shortName") or symbol,
+
+                        "qtyT0": 0,
+                        "qtyT1": 0,
+                        "qtyT2": 0,
+                        "qtyTFuture": 0,
+
+                        "qtyT0Batch": 0,
+                        "qtyT1Batch": 0,
+                        "qtyT2Batch": 0,
+                        "qtyTFutureBatch": 0,
+
+                        "qtyBatch": 0,
+                        "openQtyBatch": 0,
+                        "qty": qty_units,
+                        "open": 0,
+
+                        "dailyUnrealisedPl": 0,
+                        "unrealisedPl": 0,
+
+                        "isCurrency": bool(p.get("isCurrency", False)),
+                        "existing": bool(existing_flag),
                     }
 
-                    await safe_send_json({"data": payload, "guid": guid})
+                    await safe_send_json({"data": payload, "guid": _guid})
+
+                # ACK
+                await send_ack_200(sub_guid)
+
+                # snapshot (existing=True)
+                if not skip_history:
+                    try:
+                        snap = await adapter.get_positions_snapshot(inst_type=inst_type_s)
+                        for pos in (snap or []):
+                            await send_pos_astras(pos, True, sub_guid)
+                    except Exception:
+                        pass
+
+                # live
+                def _on_error(ev: dict):
+                    return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
+
+                async def _on_live_pos(pos: dict, _guid: str):
+                    await send_pos_astras(pos, False, _guid)
 
                 asyncio.create_task(
                     adapter.subscribe_positions(
-                        symbols,
-                        lambda p: asyncio.create_task(on_pos_opcode(p)),
-                        stop,
+                        on_data=lambda p, _g=sub_guid: asyncio.create_task(_on_live_pos(p, _g)),
+                        stop_event=stop,
+                        inst_type=inst_type_s,
+                        on_error=_on_error,
                     )
                 )
+
                 continue
+        
 
     except WebSocketDisconnect:
         pass

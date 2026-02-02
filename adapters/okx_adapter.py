@@ -82,6 +82,17 @@ class OkxAdapter:
             self._ws_public_url = "wss://ws.okx.com:8443/ws/v5/public"
             self._ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
 
+        # ВАЖНО:
+        # Приватные каналы OKX (orders / fills / account) работают ТОЛЬКО через ws/v5/private
+        # Если подписаться на них через public или business — OKX вернёт 60018 (Wrong URL or channel).
+        self._ws_private_channels = {"orders", "fills", "account", "positions"}
+
+    def _assert_private_ws(self, channel: str, ws_url: str) -> None:
+        if channel in self._ws_private_channels and ws_url != self._ws_private_url:
+            raise RuntimeError(
+                f"Private OKX channel '{channel}' must use private WS URL {self._ws_private_url}"
+            )
+
     #универсальное преобразование в float (если нет значения -> 0.0)
     def _to_float(self, v: Any) -> float:
         try:
@@ -1591,5 +1602,356 @@ class OkxAdapter:
                                 await res
 
             except Exception:
+                await asyncio.sleep(1.0)
+                continue
+
+    # REST: денежные остатки и SPOT-позиции
+    async def get_account_balances(self) -> List[Dict[str, Any]]:
+        """
+        OKX REST /account/balance
+        Используется для SPOT:
+        - валютные остатки
+        - позиции по базовой валюте инструмента
+
+        Возвращает нейтральный формат:
+        {
+          ccy, cashBal, availBal, eq
+        }
+        """
+        raw = await self._request_private("GET", "/account/balance")
+
+        out: List[Dict[str, Any]] = []
+        for item in raw.get("data", []) or []:
+            for d in item.get("details", []) or []:
+                out.append({
+                    "ccy": d.get("ccy"),
+                    "cashBal": self._to_float(d.get("cashBal")),
+                    "availBal": self._to_float(d.get("availBal")),
+                    "eq": self._to_float(d.get("eq")),
+                })
+        return out
+
+    # REST: позиции по деривативам (SWAP / FUTURES)
+    async def get_positions(self, inst_type: str = "SWAP") -> List[Dict[str, Any]]:
+        """
+        OKX REST /account/positions
+        Используется для SWAP / FUTURES.
+
+        Возвращает нейтральный формат позиции:
+        {
+          instId, instType, pos, avgPx, upl, uplRatio
+        }
+        """
+        raw = await self._request_private(
+            "GET",
+            "/account/positions",
+            params={"instType": inst_type},
+        )
+
+        out: List[Dict[str, Any]] = []
+        for item in raw.get("data", []) or []:
+            out.append({
+                "instId": item.get("instId"),
+                "instType": item.get("instType"),
+                "pos": self._to_float(item.get("pos")),
+                "avgPx": self._to_float(item.get("avgPx")),
+                "upl": self._to_float(item.get("upl")),
+                "uplRatio": self._to_float(item.get("uplRatio")),
+            })
+        return out
+
+    # WS: подписка на позиции и деньги (private)
+    async def subscribe_positions_and_balances(
+        self,
+        on_data: Callable[[Dict[str, Any]], Any],
+        stop_event: asyncio.Event,
+        inst_type: str = "SPOT",
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> None:
+        """
+        OKX private WS:
+        - channel=account   -> деньги / балансы
+        - channel=positions -> позиции (SWAP/FUTURES)
+
+        SPOT:
+        - используем account
+        SWAP/FUTURES:
+        - используем positions + account
+        """
+
+        login_msg = self._ws_login_payload()
+
+        args: List[Dict[str, Any]] = [{"channel": "account"}]
+
+        inst_type_u = str(inst_type).upper()
+        if inst_type_u in ("SWAP", "FUTURES"):
+            args.append({"channel": "positions", "instType": inst_type_u})
+
+        sub_msg = {"op": "subscribe", "args": args}
+
+        while not stop_event.is_set():
+            try:
+                async with websockets.connect(
+                    self._ws_private_url, ping_interval=20, ping_timeout=20
+                ) as ws:
+                    await ws.send(json.dumps(login_msg))
+
+                    # ждём login
+                    authed = False
+                    deadline = asyncio.get_event_loop().time() + 5.0
+                    while not authed and not stop_event.is_set():
+                        if asyncio.get_event_loop().time() > deadline:
+                            if on_error:
+                                res = on_error({"event": "error", "msg": "OKX WS login timeout"})
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
+
+                        msg = json.loads(await ws.recv())
+                        if msg.get("event") == "login" and msg.get("code") == "0":
+                            authed = True
+                            break
+                        if msg.get("event") == "error":
+                            if on_error:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
+
+                    await ws.send(json.dumps(sub_msg))
+
+                    if on_subscribed:
+                        res = on_subscribed({"event": "subscribe"})
+                        if asyncio.iscoroutine(res):
+                            await res
+
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        msg = json.loads(raw)
+                        data = msg.get("data")
+                        if not data:
+                            continue
+
+                        for item in data:
+                            res = on_data(item)
+                            if asyncio.iscoroutine(res):
+                                await res
+
+            except Exception as e:
+                if on_error:
+                    res = on_error({"event": "error", "msg": str(e)})
+                    if asyncio.iscoroutine(res):
+                        await res
+                await asyncio.sleep(1.0)
+                return
+
+    def _parse_okx_account_balance_any(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """OKX private WS/REST `account` channel/balance endpoint -> currency positions."""
+        out: List[Dict[str, Any]] = []
+        details = item.get("details") or []
+        for d in details:
+            ccy = (d.get("ccy") or "").strip()
+            if not ccy:
+                continue
+
+            cash_bal = d.get("cashBal")
+            eq = d.get("eq")
+
+            # cashBal is usually the total balance for SPOT margin-less accounts.
+            # If cashBal is absent, fall back to eq.
+            qty = self._to_float(cash_bal if cash_bal is not None else eq)
+
+            out.append(
+                {
+                    "symbol": ccy,
+                    "qtyUnits": qty,
+                    "avgPrice": 0.0,
+                    "currentPrice": 0.0,
+                    "volume": 0.0,
+                    "currentVolume": 0.0,
+                    "lotSize": 0.0,
+                    "shortName": ccy,
+                    "isCurrency": True,
+                }
+            )
+        return out
+
+    def _parse_okx_position_any(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        """OKX private WS/REST `positions` -> instrument positions."""
+        inst_id = (d.get("instId") or "").strip()
+        pos = self._to_float(d.get("pos"))
+        avg_px = self._to_float(d.get("avgPx"))
+
+        # OKX often provides markPx; last may be absent on private feed.
+        cur_px_raw = d.get("markPx")
+        if cur_px_raw is None:
+            cur_px_raw = d.get("last")
+        cur_px = self._to_float(cur_px_raw)
+
+        vol = avg_px * pos
+        cur_vol = cur_px * pos
+
+        return {
+            "symbol": inst_id,
+            "qtyUnits": pos,
+            "avgPrice": avg_px,
+            "currentPrice": cur_px,
+            "volume": vol,
+            "currentVolume": cur_vol,
+            "lotSize": 0.0,
+            "shortName": inst_id,
+            "isCurrency": False,
+        }
+
+    async def get_positions_snapshot(self, inst_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Snapshot positions for Astras PositionsGetAndSubscribeV2.
+
+        - SPOT: uses /account/balance -> currency balances (isCurrency=True)
+        - FUTURES/SWAP: uses /account/positions -> instrument positions (isCurrency=False)
+
+        Returns a neutral list of dicts that server.py maps to Astras Simple.
+        """
+        inst_type_s = (str(inst_type).strip().upper() if inst_type else "SPOT")
+
+        out: List[Dict[str, Any]] = []
+
+        # 1) Currency balances (SPOT cash) — always safe to return
+        try:
+            bal = await self._request_private("GET", "/account/balance")
+            data = bal.get("data") or []
+            if data:
+                out.extend(self._parse_okx_account_balance_any(data[0] or {}))
+        except Exception:
+            # If account/balance fails, return empty snapshot.
+            pass
+
+        # 2) Derivatives positions (FUTURES/SWAP)
+        if inst_type_s in ("FUTURES", "SWAP"):
+            try:
+                pos = await self._request_private("GET", "/account/positions", params={"instType": inst_type_s})
+                for it in (pos.get("data") or []):
+                    out.append(self._parse_okx_position_any(it or {}))
+            except Exception:
+                pass
+
+        return out
+
+    async def subscribe_positions(
+        self,
+        on_data: Callable[[Dict[str, Any]], Any],
+        stop_event: asyncio.Event,
+        inst_type: Optional[str] = None,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> None:
+        """Private WS subscribe for positions.
+
+        We keep the WS connection alive and forward:
+        - `account` channel -> currency balances (isCurrency=True)
+        - `positions` channel (for FUTURES/SWAP) -> instrument positions (isCurrency=False)
+
+        `server.py` decides how to mark these as existing/live.
+        """
+        inst_type_s = (str(inst_type).strip().upper() if inst_type else "SPOT")
+
+        # OKX private channels must use private WS URL
+        self._assert_private_ws("account", self._ws_private_url)
+        if inst_type_s in ("FUTURES", "SWAP"):
+            self._assert_private_ws("positions", self._ws_private_url)
+
+        async def _call(cb, arg):
+            if cb is None:
+                return
+            try:
+                r = cb(arg)
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception:
+                return
+
+        login_msg = self._ws_login_payload()
+
+        sub_args: List[Dict[str, Any]] = [{"channel": "account"}]
+        if inst_type_s in ("FUTURES", "SWAP"):
+            sub_args.append({"channel": "positions", "instType": inst_type_s})
+
+        sub_msg = {"op": "subscribe", "args": sub_args}
+
+        while not stop_event.is_set():
+            try:
+                async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
+                    # login
+                    await ws.send(json.dumps(login_msg))
+
+                    # wait login event
+                    authed = False
+                    while not stop_event.is_set() and not authed:
+                        raw = await ws.recv()
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="replace")
+                        m = json.loads(raw)
+
+                        if m.get("event") == "login":
+                            if m.get("code") == "0":
+                                authed = True
+                                break
+                            await _call(on_error, m)
+                            return
+
+                        if m.get("event") == "error":
+                            await _call(on_error, m)
+                            return
+
+                    if not authed:
+                        continue
+
+                    # subscribe
+                    await ws.send(json.dumps(sub_msg))
+
+                    # main loop
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="replace")
+
+                        m = json.loads(raw)
+
+                        if m.get("event") == "error":
+                            await _call(on_error, m)
+                            return
+
+                        arg = m.get("arg") or {}
+                        ch = arg.get("channel")
+                        data = m.get("data")
+                        if not ch or not data:
+                            continue
+
+                        if ch == "account":
+                            # data is a list, each item contains `details`
+                            for it in (data or []):
+                                for pos in self._parse_okx_account_balance_any(it or {}):
+                                    r = on_data(pos)
+                                    if asyncio.iscoroutine(r):
+                                        await r
+                            continue
+
+                        if ch == "positions":
+                            for it in (data or []):
+                                pos = self._parse_okx_position_any(it or {})
+                                r = on_data(pos)
+                                if asyncio.iscoroutine(r):
+                                    await r
+                            continue
+
+            except Exception as e:
+                await _call(on_error, {"event": "error", "msg": str(e)})
                 await asyncio.sleep(1.0)
                 continue
