@@ -1721,11 +1721,44 @@ class OkxAdapter:
 
                     await ws.send(json.dumps(sub_msg))
 
-                    if on_subscribed:
-                        res = on_subscribed({"event": "subscribe"})
-                        if asyncio.iscoroutine(res):
-                            await res
+                    # Ждём реальный event: subscribe от OKX, а не шлём "заглушку"
+                    subscribed = False
+                    sub_deadline = asyncio.get_event_loop().time() + 5.0
+                    while not subscribed and not stop_event.is_set():
+                        if asyncio.get_event_loop().time() > sub_deadline:
+                            if on_error:
+                                res = on_error({"event": "error", "msg": "OKX WS subscribe timeout"})
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
 
+                        raw = await ws.recv()
+                        msg = json.loads(raw)
+
+                        if msg.get("event") == "error":
+                            if on_error:
+                                res = on_error(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            return
+
+                        if msg.get("event") == "subscribe":
+                            if on_subscribed:
+                                res = on_subscribed(msg)
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            subscribed = True
+                            break
+
+                        # Если пришли данные раньше subscribe — не теряем: прокидываем в on_data
+                        data = msg.get("data")
+                        if data:
+                            for item in data:
+                                res = on_data(item)
+                                if asyncio.iscoroutine(res):
+                                    await res
+
+                    # основной цикл чтения данных
                     while not stop_event.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -1846,6 +1879,7 @@ class OkxAdapter:
         on_data: Callable[[Dict[str, Any]], Any],
         stop_event: asyncio.Event,
         inst_type: Optional[str] = None,
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         """Private WS subscribe for positions.
@@ -1912,7 +1946,47 @@ class OkxAdapter:
                     # subscribe
                     await ws.send(json.dumps(sub_msg))
 
-                    # main loop
+                    # Ждём реальный event: subscribe от OKX, а не "заглушку"
+                    subscribed = False
+                    sub_deadline = asyncio.get_event_loop().time() + 5.0
+                    while not subscribed and not stop_event.is_set():
+                        if asyncio.get_event_loop().time() > sub_deadline:
+                            await _call(on_error, {"event": "error", "msg": "OKX WS subscribe timeout"})
+                            return
+
+                        raw = await ws.recv()
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="replace")
+                        m = json.loads(raw)
+
+                        if m.get("event") == "subscribe":
+                            await _call(on_subscribed, m)
+                            subscribed = True
+                            break
+
+                        if m.get("event") == "error":
+                            await _call(on_error, m)
+                            return
+
+                        # Если прилетели данные до subscribe — обработаем их, чтобы не потерять
+                        arg = m.get("arg") or {}
+                        ch = arg.get("channel")
+                        data = m.get("data")
+                        if ch and data:
+                            if ch == "account":
+                                for it in (data or []):
+                                    for pos in self._parse_okx_account_balance_any(it or {}):
+                                        r = on_data(pos)
+                                        if asyncio.iscoroutine(r):
+                                            await r
+                            elif ch == "positions":
+                                for it in (data or []):
+                                    pos = self._parse_okx_position_any(it or {})
+                                    r = on_data(pos)
+                                    if asyncio.iscoroutine(r):
+                                        await r
+
+                    # основной цикл чтения данных
                     while not stop_event.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -2014,6 +2088,7 @@ class OkxAdapter:
         self,
         on_data: Callable[[Dict[str, Any]], Any],
         stop_event: asyncio.Event,
+        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         """Live-подписка для Summaries (нейтральный формат) через OKX private WS channel=account.
@@ -2066,6 +2141,41 @@ class OkxAdapter:
 
                     await ws.send(json.dumps(sub_msg))
 
+                    # Ждём реальный event: subscribe от OKX, а не "заглушку"
+                    subscribed = False
+                    sub_deadline = asyncio.get_event_loop().time() + 5.0
+                    while not subscribed and not stop_event.is_set():
+                        if asyncio.get_event_loop().time() > sub_deadline:
+                            await _call(on_error, {"event": "error", "msg": "OKX WS subscribe timeout"})
+                            return
+
+                        raw = await ws.recv()
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="replace")
+                        m = json.loads(raw)
+
+                        if m.get("event") == "subscribe":
+                            # summaries подтверждаем через on_subscribed, если оно передано
+                            # (server.py решает, нужно ли это Astras)
+                            await _call(on_subscribed, m)
+                            subscribed = True
+                            break
+
+                        if m.get("event") == "error":
+                            await _call(on_error, m)
+                            return
+
+                        # Если обновления account пришли раньше subscribe — обработаем
+                        arg = m.get("arg") or {}
+                        if arg.get("channel") == "account":
+                            data = m.get("data") or []
+                            if data:
+                                summary = self._parse_okx_account_summary_any(data[0] or {})
+                                r = on_data(summary)
+                                if asyncio.iscoroutine(r):
+                                    await r
+
+                    # основной цикл чтения данных
                     while not stop_event.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
