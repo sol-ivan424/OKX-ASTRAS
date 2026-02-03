@@ -1955,3 +1955,147 @@ class OkxAdapter:
                 await _call(on_error, {"event": "error", "msg": str(e)})
                 await asyncio.sleep(1.0)
                 continue
+    
+    # Summaries (сводная информация по "портфелю" = аккаунту OKX)
+    def _parse_okx_account_summary_any(self, acc: Dict[str, Any]) -> Dict[str, Any]:
+        """OKX /account/balance (data[0]) -> нейтральная сводка (OKX-поля).
+
+        Важно: НЕ формируем формат Astras здесь.
+        Здесь возвращаем только то, что реально есть в OKX, чтобы server.py сам собрал ответ Astras.
+
+        Нейтральный формат:
+        {
+          "totalEq": float,
+          "availEq": float,
+          "imr": float,
+          "mmr": float,
+          "byCcy": [ {"ccy": str, "availEq": float}, ... ]
+        }
+        """
+        total_eq = self._to_float(acc.get("totalEq"))
+        avail_eq = self._to_float(acc.get("availEq"))
+        imr = self._to_float(acc.get("imr"))
+        mmr = self._to_float(acc.get("mmr"))
+
+        by_ccy: List[Dict[str, Any]] = []
+        for d in (acc.get("details") or []):
+            ccy = (d.get("ccy") or "").strip()
+            if not ccy:
+                continue
+            by_ccy.append(
+                {
+                    "ccy": ccy,
+                    "availEq": self._to_float(d.get("availEq")),
+                }
+            )
+
+        return {
+            "totalEq": total_eq,
+            "availEq": avail_eq,
+            "imr": imr,
+            "mmr": mmr,
+            "byCcy": by_ccy,
+        }
+
+    async def get_summaries_snapshot(self) -> Dict[str, Any]:
+        """Snapshot для SummariesGetAndSubscribeV2 (нейтральный формат).
+
+        Берём /api/v5/account/balance и возвращаем нейтральные OKX-поля.
+        Формат Astras собирается в server.py.
+        """
+        raw = await self._request_private("GET", "/account/balance")
+        data = raw.get("data") or []
+        if not data:
+            raise RuntimeError("OKX /account/balance returned empty data")
+
+        return self._parse_okx_account_summary_any(data[0] or {})
+
+    async def subscribe_summaries(
+        self,
+        on_data: Callable[[Dict[str, Any]], Any],
+        stop_event: asyncio.Event,
+        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> None:
+        """Live-подписка для Summaries (нейтральный формат) через OKX private WS channel=account.
+
+        OKX не присылает отдельного "portfolio summary" канала — берём account updates.
+        Каждый update маппим в нейтральную сводку OKX и отдаём в server.py.
+        """
+
+        self._assert_private_ws("account", self._ws_private_url)
+
+        async def _call(cb, arg):
+            if cb is None:
+                return
+            try:
+                r = cb(arg)
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception:
+                return
+
+        login_msg = self._ws_login_payload()
+        sub_msg = {"op": "subscribe", "args": [{"channel": "account"}]}
+
+        while not stop_event.is_set():
+            try:
+                async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
+                    # login
+                    await ws.send(json.dumps(login_msg))
+
+                    authed = False
+                    while not stop_event.is_set() and not authed:
+                        raw = await ws.recv()
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="replace")
+                        m = json.loads(raw)
+
+                        if m.get("event") == "login":
+                            if m.get("code") == "0":
+                                authed = True
+                                break
+                            await _call(on_error, m)
+                            return
+
+                        if m.get("event") == "error":
+                            await _call(on_error, m)
+                            return
+
+                    if not authed:
+                        continue
+
+                    await ws.send(json.dumps(sub_msg))
+
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="replace")
+
+                        m = json.loads(raw)
+
+                        if m.get("event") == "error":
+                            await _call(on_error, m)
+                            return
+
+                        arg = m.get("arg") or {}
+                        if arg.get("channel") != "account":
+                            continue
+
+                        data = m.get("data") or []
+                        # OKX возвращает data как список; берём первый элемент
+                        if not data:
+                            continue
+
+                        summary = self._parse_okx_account_summary_any(data[0] or {})
+                        r = on_data(summary)
+                        if asyncio.iscoroutine(r):
+                            await r
+
+            except Exception as e:
+                await _call(on_error, {"event": "error", "msg": str(e)})
+                await asyncio.sleep(1.0)
+                continue

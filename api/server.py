@@ -2112,7 +2112,6 @@ async def stream(ws: WebSocket):
                 continue
 
             # все сделки по портфелю (Astras Simple)
-            # все сделки по портфелю (history + подписка). если OKX WS trades недоступен — придёт ошибка от OKX (например 60029)
             if opcode == "TradesGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["fills"].append(stop)
@@ -2339,6 +2338,124 @@ async def stream(ws: WebSocket):
 
                 continue
         
+            # сводная информация о портфеле/аккаунте (Astras Simple)
+            if opcode == "SummariesGetAndSubscribeV2":
+                stop = asyncio.Event()
+                active["summaries"].append(stop)
+
+                portfolio = msg.get("portfolio") or "0"
+                skip_history = bool(msg.get("skipHistory", False))
+                sub_guid = msg.get("guid") or req_guid
+
+                # если Astras переиспользовал guid — остановим старую подписку
+                old = subs.pop(sub_guid, None)
+                if old:
+                    old.set()
+                subs[sub_guid] = stop
+
+                async def send_summary_astras(s: dict, _guid: str):
+                    total_eq = float(s.get("totalEq", 0) or 0)
+                    avail_eq = float(s.get("availEq", 0) or 0)
+                    imr = float(s.get("imr", 0) or 0)
+
+                    by_ccy = s.get("byCcy") or []
+                    buying_power_by_ccy = []
+                    for x in by_ccy:
+                        ccy = x.get("ccy")
+                        if not ccy:
+                            continue
+                        buying_power_by_ccy.append({
+                            "currency": str(ccy),
+                            "buyingPower": float(x.get("availEq", 0) or 0),
+                        })
+
+                    payload = {
+                        "buyingPowerAtMorning": 0,
+                        "buyingPower": avail_eq,
+                        "profit": 0,
+                        "profitRate": 0,
+                        "portfolioEvaluation": total_eq,
+                        "portfolioLiquidationValue": total_eq,
+
+                        "initialMargin": imr,
+                        "correctedMargin": imr,
+                        "riskBeforeForcePositionClosing": 0,
+
+                        "commission": 0,
+                        "buyingPowerByCurrency": buying_power_by_ccy,
+                    }
+
+                    await safe_send_json({"data": payload, "guid": _guid})
+
+                subscribed_evt = asyncio.Event()
+                error_evt = asyncio.Event()
+
+                history_done = False
+                live_buffer: list[dict] = []
+
+                def _on_subscribed(_ev: dict):
+                    subscribed_evt.set()
+
+                def _on_error(ev: dict):
+                    error_evt.set()
+                    return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
+
+                async def _on_live_summary(s: dict, _guid: str):
+                    nonlocal history_done
+                    if not history_done:
+                        live_buffer.append(s)
+                        return
+                    await send_summary_astras(s, _guid)
+
+                # запуск подписки OKX
+                try:
+                    asyncio.create_task(
+                        adapter.subscribe_summaries(
+                            on_data=lambda s, _g=sub_guid: asyncio.create_task(_on_live_summary(s, _g)),
+                            stop_event=stop,
+                            on_subscribed=_on_subscribed,
+                            on_error=_on_error,
+                        )
+                    )
+                except Exception as e:
+                    await send_error_and_close(sub_guid, 500, str(e))
+                    continue
+
+                # ждём подтверждение подписки или ошибку
+                done, pending = await asyncio.wait(
+                    [
+                        asyncio.create_task(subscribed_evt.wait()),
+                        asyncio.create_task(error_evt.wait()),
+                    ],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+
+                if error_evt.is_set():
+                    raise WebSocketDisconnect
+
+                # ACK
+                await send_ack_200(sub_guid)
+
+                # snapshot
+                if not skip_history:
+                    try:
+                        snap = await adapter.get_summaries_snapshot()
+                        await send_summary_astras(snap or {}, sub_guid)
+                    except Exception as e:
+                        await send_error_and_close(sub_guid, 500, str(e))
+                        continue
+
+                history_done = True
+
+                # live из буфера
+                if live_buffer:
+                    for s in live_buffer:
+                        await send_summary_astras(s, sub_guid)
+                    live_buffer.clear()
+
+                continue
 
     except WebSocketDisconnect:
         pass
