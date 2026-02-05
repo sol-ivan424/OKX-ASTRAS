@@ -1736,15 +1736,15 @@ async def stream(ws: WebSocket):
                 except Exception:
                     frequency = 25
 
-                async def send_order_astras(order_any: dict, existing_flag: bool, _guid=sub_guid):
+                async def send_order_astras(order_any: dict, existing_flag: bool, _guid=sub_guid, apply_status_filter: bool = False):
                     payload = _astras_order_simple_from_okx_neutral(
                         order_any,
                         exchange=exchange,
                         portfolio=portfolio,
                         existing=existing_flag,
                     )
-
-                    if statuses:
+                    # orderStatuses по документации Astras влияет только на первичную историю
+                    if apply_status_filter and statuses:
                         st = payload.get("status", "0")
                         if st not in statuses:
                             return
@@ -1775,12 +1775,16 @@ async def stream(ws: WebSocket):
                         return
                     await send_order_astras(o, False, _guid)  # existing=False — новые события (private WS orders)
 
+                inst_type_msg = msg.get("instrumentGroup") or msg.get("board")
+                inst_type_ws = str(inst_type_msg).strip().upper() if inst_type_msg else ""
+                inst_type_rest = str(inst_type_msg).strip().upper() if inst_type_msg else None
+
                 asyncio.create_task(
                     adapter.subscribe_orders(
                         symbols,
                         lambda ord_, _g=sub_guid: asyncio.create_task(_on_live_order(ord_, _g)),
                         stop,
-                        inst_type=inst_type,
+                        inst_type=inst_type_ws,
                         on_subscribed=_on_subscribed,
                         on_error=_on_error,
                     )
@@ -1804,16 +1808,31 @@ async def stream(ws: WebSocket):
                 # Подписка подтверждена, отправляем ACK 200
                 await send_ack_200(sub_guid)
 
+                # REST history: orders-history (SPOT + FUTURES + SWAP)
+                if not skip_history and hasattr(adapter, "get_orders_history"):
+                    try:
+                        inst_types = ["SPOT", "FUTURES", "SWAP"] if not inst_type_rest else [inst_type_rest]
+                        for it in inst_types:
+                            history = await adapter.get_orders_history(
+                                inst_type=it,
+                                limit=100,
+                            )
+                            for ho in history:
+                                await send_order_astras(ho, True, sub_guid, apply_status_filter=True)
+                    except Exception:
+                        pass
+
                 # история заявок (pending) через REST
                 if (not skip_history) and hasattr(adapter, "get_orders_pending"):
                     try:
-                        inst_id = symbols[0] if symbols else None
-                        history_orders = await adapter.get_orders_pending(
-                            inst_type=inst_type,
-                            inst_id=inst_id,
-                        )
-                        for ho in history_orders:
-                            await send_order_astras(ho, True, sub_guid)  # existing=True — данные из снепшота/истории (pending REST)
+                        inst_types = ["SPOT", "FUTURES", "SWAP"] if not inst_type_rest else [inst_type_rest]
+                        for it in inst_types:
+                            history_orders = await adapter.get_orders_pending(
+                                inst_type=it,
+                                inst_id=(symbols[0] if symbols else None),
+                            )
+                            for ho in history_orders:
+                                await send_order_astras(ho, True, sub_guid)  # existing=True — данные из снепшота/истории (pending REST)
                     except Exception:
                         pass
 
@@ -2178,14 +2197,14 @@ async def stream(ws: WebSocket):
                         "comment": None,
 
                         "symbol": symbol,
-                        "brokerSymbol": f"{exchange_out}:{symbol}",
+                        "brokerSymbol": symbol,
                         "exchange": exchange_out,
 
                         "date": date_iso,
                         "board": None,  # у OKX нет board
 
                         # Astras Simple
-                        "qtyUnits": qty,
+                        "qtyUnits": 0,
                         "qtyBatch": 0,
                         "qty": qty,
 
@@ -2227,11 +2246,15 @@ async def stream(ws: WebSocket):
                         return
                     await send_trade_astras(tr, False, _guid)
 
+                inst_type_msg = msg.get("instrumentGroup") or msg.get("board")
+                inst_type_ws = str(inst_type_msg).strip().upper() if inst_type_msg else ""
+                inst_type_rest = str(inst_type_msg).strip().upper() if inst_type_msg else None
+
                 asyncio.create_task(
                     adapter.subscribe_trades(
                         on_data=lambda tr, _g=sub_guid: asyncio.create_task(_on_live_trade(tr, _g)),
                         stop_event=stop,
-                        inst_type=inst_type,
+                        inst_type=inst_type_ws,
                         on_subscribed=_on_subscribed,
                         on_error=_on_error,
                     )
@@ -2245,7 +2268,7 @@ async def stream(ws: WebSocket):
                 # история сделок (REST)
                 if (not skip_history) and hasattr(adapter, "get_trades_history"):
                     try:
-                        history = await adapter.get_trades_history(inst_type=inst_type, limit=100)
+                        history = await adapter.get_trades_history(inst_type=inst_type_rest, limit=100)
                         for tr in history:
                             await send_trade_astras(tr, True, sub_guid)
                     except Exception:

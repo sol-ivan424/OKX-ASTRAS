@@ -880,18 +880,99 @@ class OkxAdapter:
         state: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"instType": inst_type, "limit": str(int(limit))}
-        if inst_id:
-            params["instId"] = inst_id
-        if ord_type:
-            params["ordType"] = ord_type
-        if state:
-            params["state"] = state
+        def _norm_inst_type(x: Optional[str]) -> Optional[str]:
+            if x is None:
+                return None
+            s = str(x).strip().upper()
+            return s or None
 
-        raw = await self._request_private("GET", "/trade/orders-pending", params=params)
+        it = _norm_inst_type(inst_type)
+
+        # Если inst_type не задан или не распознан — берём по всем основным типам
+        if it in ("SPOT", "SWAP", "FUTURES"):
+            inst_types = [it]
+        else:
+            inst_types = ["SPOT", "SWAP", "FUTURES"]
+
         out: List[Dict[str, Any]] = []
-        for item in raw.get("data", []):
-            out.append(self._parse_okx_order_any(item))
+
+        for one_type in inst_types:
+            params: Dict[str, Any] = {"instType": one_type, "limit": str(int(limit))}
+            if inst_id:
+                params["instId"] = inst_id
+            if ord_type:
+                params["ordType"] = ord_type
+            if state:
+                params["state"] = state
+
+            raw = await self._request_private("GET", "/trade/orders-pending", params=params)
+            for item in raw.get("data", []) or []:
+                out.append(self._parse_okx_order_any(item))
+
+        # сортируем по времени обновления
+        out.sort(key=lambda x: int(x.get("ts_update", 0) or 0))
+        return out
+
+
+    #REST: история заявок (orders-history)
+    async def get_orders_history(
+        self,
+        inst_type: Optional[str] = None,
+        inst_id: Optional[str] = None,
+        ord_type: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Возвращает историю заявок в нейтральном формате (как _parse_okx_order_any).
+
+        OKX endpoint: /trade/orders-history
+
+        Важно:
+        - В запросе Astras на историю заявок instType может отсутствовать.
+          Если inst_type=None — считаем, что нужно взять историю по всему аккаунту,
+          и делаем запросы для SPOT + SWAP + FUTURES, объединяя результат.
+
+        Параметры:
+        - inst_id / ord_type / state — опциональные фильтры OKX.
+        - limit — ограничение на ответ OKX (обычно до 100).
+        """
+
+        def _norm_inst_type(x: Optional[str]) -> Optional[str]:
+            if x is None:
+                return None
+            s = str(x).strip().upper()
+            return s or None
+
+        it = _norm_inst_type(inst_type)
+
+        # Если inst_type не задан — берём по всем основным типам
+        inst_types: List[str]
+        if it is None:
+            inst_types = ["SPOT", "SWAP", "FUTURES"]
+        else:
+            inst_types = [it]
+
+        out: List[Dict[str, Any]] = []
+
+        for one_type in inst_types:
+            params: Dict[str, Any] = {
+                "instType": one_type,
+                "limit": str(int(limit)),
+            }
+            if inst_id:
+                params["instId"] = str(inst_id)
+            if ord_type:
+                params["ordType"] = str(ord_type)
+            if state:
+                params["state"] = str(state)
+
+            raw = await self._request_private("GET", "/trade/orders-history", params=params)
+            for item in raw.get("data", []) or []:
+                out.append(self._parse_okx_order_any(item))
+
+        # сортируем по времени обновления
+        out.sort(key=lambda x: int(x.get("ts_update", 0) or 0))
         return out
 
     #REST: выставление рыночной заявки (market order)
@@ -1236,8 +1317,17 @@ class OkxAdapter:
     ) -> None:
         login_msg = self._ws_login_payload()
 
-        sub_args: Dict[str, Any] = {"channel": "orders", "instType": inst_type}
-        sub_msg = {"op": "subscribe", "args": [sub_args]}
+        inst_type_u = str(inst_type).strip().upper() if inst_type else ""
+        if inst_type_u in ("SPOT", "SWAP", "FUTURES"):
+            inst_types = [inst_type_u]
+        else:
+            inst_types = ["SPOT", "SWAP", "FUTURES"]
+
+        sub_args_list: List[Dict[str, Any]] = []
+        for it in inst_types:
+            sub_args_list.append({"channel": "orders", "instType": it})
+
+        sub_msg = {"op": "subscribe", "args": sub_args_list}
 
         while not stop_event.is_set():
             try:
