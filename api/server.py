@@ -147,14 +147,16 @@ def widget_settings_write(payload: dict = Body(default={})):
 
 @app.get("/client/v1.0/users/{user_id}/all-portfolios")
 def all_portfolios(user_id: str):
-    # Astras ожидает список портфелей пользователя.
-    # Для DEV режима вернём один виртуальный портфель.
+    # OKX: считаем весь аккаунт одним "портфелем" для Astras
+    portfolio_id = "DEV_portfolio"
+
     return JSONResponse([
         {
-            "portfolio": "DEV_portfolio",
-            "exchange": "OKX",
-            "name": "DEV",
-            "isDefault": True
+            "agreement": "39004",
+            "portfolio": portfolio_id,
+            "tks": portfolio_id,
+            "market": "OKX",
+            "isVirtual": True,
         }
     ])
 
@@ -1524,6 +1526,18 @@ async def stream(ws: WebSocket):
             req_guid = msg.get("guid")
             # inst_type может приходить как instrumentGroup или как board
             inst_type = msg.get("instrumentGroup") or msg.get("board")
+
+            if opcode == "authorize":
+                auth_guid = msg.get("guid") or req_guid
+
+                await safe_send_json(
+                    {
+                        "requestGuid": auth_guid,
+                        "httpCode": 200,
+                        "message": "The connection has been initialized.",
+                    }
+                )
+                continue
 
             if opcode == "ping":
                 ping_guid = msg["guid"]
