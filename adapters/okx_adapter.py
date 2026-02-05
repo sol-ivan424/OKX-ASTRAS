@@ -1179,7 +1179,7 @@ class OkxAdapter:
     #REST: история сделок (fills-history) — исполнения за последние 3 месяца
     async def get_trades_history(
         self,
-        inst_type: str = "SPOT",
+        inst_type: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         """
@@ -1187,13 +1187,41 @@ class OkxAdapter:
 
         OKX endpoint: /trade/fills-history
         Возвращает историю за последние 3 месяца.
-        """
-        params: Dict[str, Any] = {"instType": inst_type, "limit": str(int(limit))}
-        raw = await self._request_private("GET", "/trade/fills-history", params=params)
 
+        Важно:
+        - В запросе Astras TradesGetAndSubscribeV2 нет instType.
+          Если inst_type=None — считаем, что нужно взять историю по всему аккаунту,
+          и делаем запросы для SPOT + SWAP + FUTURES, объединяя результат.
+        """
+
+        def _norm_inst_type(x: Optional[str]) -> Optional[str]:
+            if x is None:
+                return None
+            s = str(x).strip().upper()
+            return s or None
+
+        it = _norm_inst_type(inst_type)
+
+        # Если inst_type не задан — берём по всем основным типам
+        inst_types: List[str]
+        if it is None:
+            inst_types = ["SPOT", "SWAP", "FUTURES"]
+        else:
+            inst_types = [it]
+
+        # Собираем историю (без удаления дублей)
         out: List[Dict[str, Any]] = []
-        for item in raw.get("data", []):
-            out.append(self._parse_okx_trade_any(item, is_history=True, inst_type=inst_type))
+
+        for one_type in inst_types:
+            params: Dict[str, Any] = {"instType": one_type, "limit": str(int(limit))}
+            raw = await self._request_private("GET", "/trade/fills-history", params=params)
+
+            for item in raw.get("data", []) or []:
+                t = self._parse_okx_trade_any(item, is_history=True, inst_type=one_type)
+                out.append(t)
+
+        # сортируем по времени
+        out.sort(key=lambda x: int(x.get("ts", 0) or 0))
         return out
 
     #WS: подписка на изменения заявок (private channel orders)
@@ -1315,10 +1343,19 @@ class OkxAdapter:
         Поле existing формируется в server.py, здесь есть флаг is_history=False.
         """
         login_msg = self._ws_login_payload()
-        inst_type = str(inst_type).upper()
-        assert inst_type in ("SPOT","SWAP","FUTURES")
-        sub_args: Dict[str, Any] = {"channel": "orders", "instType": inst_type}
-        sub_msg = {"op": "subscribe", "args": [sub_args]}
+        # instType может не прийти от Astras. Для OKX private channel `orders` он нужен.
+        # Если inst_type не задан — подписываемся сразу на все типы, чтобы получить все сделки по аккаунту.
+        inst_type_u = str(inst_type).strip().upper() if inst_type else ""
+        if inst_type_u in ("SPOT", "SWAP", "FUTURES"):
+            inst_types = [inst_type_u]
+        else:
+            inst_types = ["SPOT", "SWAP", "FUTURES"]
+
+        sub_args_list: List[Dict[str, Any]] = []
+        for it in inst_types:
+            sub_args_list.append({"channel": "orders", "instType": it})
+
+        sub_msg = {"op": "subscribe", "args": sub_args_list}
 
         while not stop_event.is_set():
             try:

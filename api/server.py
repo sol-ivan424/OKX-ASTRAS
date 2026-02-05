@@ -1437,6 +1437,42 @@ async def stream(ws: WebSocket):
             }
         )
 
+    async def wait_okx_subscribed_or_error(
+        subscribed_ev: asyncio.Event,
+        error_ev: asyncio.Event,
+        guid: str,
+        stop_ev: asyncio.Event,
+        timeout_s: float = 5.0,
+    ) -> bool:
+        done, pending = await asyncio.wait(
+            [
+                asyncio.create_task(subscribed_ev.wait()),
+                asyncio.create_task(error_ev.wait()),
+            ],
+            timeout=timeout_s,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+
+        # если пришла ошибка — _handle_okx_ws_error уже отправляет ошибку и закрывает WS
+        if error_ev.is_set():
+            stop_ev.set()
+            return False
+        # если подписка подтверждена
+        if subscribed_ev.is_set():
+            return True
+        # таймаут ожидания subscribe/error
+        await safe_send_json(
+            {
+                "message": "OKX subscribe timeout",
+                "httpCode": 504,
+                "requestGuid": guid,
+            }
+        )
+        stop_ev.set()
+        return False
+
     # Astras сообщение: ошибка + закрыть WS
     async def send_error_and_close(guid: str | None, http_code: int, message: str):
         try:
@@ -2201,20 +2237,9 @@ async def stream(ws: WebSocket):
                     )
                 )
 
-                done, pending = await asyncio.wait(
-                    [
-                        asyncio.create_task(subscribed_evt.wait()),
-                        asyncio.create_task(error_evt.wait()),
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                for t in pending:
-                    t.cancel()
-
-                if error_evt.is_set():
-                    raise WebSocketDisconnect
-
-                # ACK
+                # ждём реальный subscribe/error от OKX, и только потом шлём ACK(200)
+                if not await wait_okx_subscribed_or_error(subscribed_evt, error_evt, sub_guid, stop):
+                    continue
                 await send_ack_200(sub_guid)
 
                 # история сделок (REST)
@@ -2308,7 +2333,40 @@ async def stream(ws: WebSocket):
 
                     await safe_send_json({"data": payload, "guid": _guid})
 
-                # ACK
+                # события подписки OKX
+                subscribed_evt = asyncio.Event()
+                error_evt = asyncio.Event()
+
+                # чтобы порядок был: ACK(200) -> snapshot -> live
+                history_done = False
+                live_buffer: list[dict] = []
+
+                # live
+                def _on_error(ev: dict):
+                    error_evt.set()
+                    return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
+
+                async def _on_live_pos(pos: dict, _guid: str):
+                    nonlocal history_done
+                    if not history_done:
+                        live_buffer.append(pos)
+                        return
+                    await send_pos_astras(pos, False, _guid)
+
+                def _on_subscribed(_ev: dict):
+                    subscribed_evt.set()
+
+                asyncio.create_task(
+                    adapter.subscribe_positions(
+                        on_data=lambda p, _g=sub_guid: asyncio.create_task(_on_live_pos(p, _g)),
+                        stop_event=stop,
+                        inst_type=inst_type_s,
+                        on_error=_on_error,
+                        on_subscribed=_on_subscribed,
+                    )
+                )
+                if not await wait_okx_subscribed_or_error(subscribed_evt, error_evt, sub_guid, stop):
+                    continue
                 await send_ack_200(sub_guid)
 
                 # snapshot (existing=True)
@@ -2320,22 +2378,12 @@ async def stream(ws: WebSocket):
                     except Exception:
                         pass
 
-                # live
-                def _on_error(ev: dict):
-                    return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
-
-                async def _on_live_pos(pos: dict, _guid: str):
-                    await send_pos_astras(pos, False, _guid)
-
-                asyncio.create_task(
-                    adapter.subscribe_positions(
-                        on_data=lambda p, _g=sub_guid: asyncio.create_task(_on_live_pos(p, _g)),
-                        stop_event=stop,
-                        inst_type=inst_type_s,
-                        on_error=_on_error,
-                    )
-                )
-
+                history_done = True
+                # live из буфера
+                if live_buffer:
+                    for pos in live_buffer:
+                        await send_pos_astras(pos, False, sub_guid)
+                    live_buffer.clear()
                 continue
         
             # сводная информация о портфеле/аккаунте (Astras Simple)
@@ -2389,13 +2437,11 @@ async def stream(ws: WebSocket):
 
                 subscribed_evt = asyncio.Event()
                 error_evt = asyncio.Event()
-
                 history_done = False
                 live_buffer: list[dict] = []
 
                 def _on_subscribed(_ev: dict):
                     subscribed_evt.set()
-
                 def _on_error(ev: dict):
                     error_evt.set()
                     return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
@@ -2407,35 +2453,19 @@ async def stream(ws: WebSocket):
                         return
                     await send_summary_astras(s, _guid)
 
-                # запуск подписки OKX
-                try:
-                    asyncio.create_task(
-                        adapter.subscribe_summaries(
-                            on_data=lambda s, _g=sub_guid: asyncio.create_task(_on_live_summary(s, _g)),
-                            stop_event=stop,
-                            on_subscribed=_on_subscribed,
-                            on_error=_on_error,
-                        )
+                # запуск подписки OKX (ошибки подписки должны приходить через on_error)
+                asyncio.create_task(
+                    adapter.subscribe_summaries(
+                        on_data=lambda s, _g=sub_guid: asyncio.create_task(_on_live_summary(s, _g)),
+                        stop_event=stop,
+                        on_subscribed=_on_subscribed,
+                        on_error=_on_error,
                     )
-                except Exception as e:
-                    await send_error_and_close(sub_guid, 500, str(e))
-                    continue
-
-                # ждём подтверждение подписки или ошибку
-                done, pending = await asyncio.wait(
-                    [
-                        asyncio.create_task(subscribed_evt.wait()),
-                        asyncio.create_task(error_evt.wait()),
-                    ],
-                    return_when=asyncio.FIRST_COMPLETED
                 )
-                for t in pending:
-                    t.cancel()
 
-                if error_evt.is_set():
-                    raise WebSocketDisconnect
-
-                # ACK
+                # ACK(200) только после реального subscribe от OKX
+                if not await wait_okx_subscribed_or_error(subscribed_evt, error_evt, sub_guid, stop):
+                    continue
                 await send_ack_200(sub_guid)
 
                 # snapshot
@@ -2443,9 +2473,8 @@ async def stream(ws: WebSocket):
                     try:
                         snap = await adapter.get_summaries_snapshot()
                         await send_summary_astras(snap or {}, sub_guid)
-                    except Exception as e:
-                        await send_error_and_close(sub_guid, 500, str(e))
-                        continue
+                    except Exception:
+                        pass
 
                 history_done = True
 
