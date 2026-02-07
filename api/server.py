@@ -112,9 +112,198 @@ def widget_settings(serviceName: str = Query(default="Astras")):
     return JSONResponse([])
 
 @app.get("/md/v2/clients/{client_id}/positions")
-def positions(client_id: str):
-    # Пустые позиции
-    return JSONResponse([])
+async def md_client_positions(
+    client_id: str,
+    exchange: str | None = None,
+    portfolio: str | None = None,
+    format: str = "Simple",
+    withoutCurrency: bool = False,
+    jsonResponse: bool = False,
+):
+    #Используем тот же snapshot, что и в WS PositionsGetAndSubscribeV2.
+    #exchange_out = exchange or "OKX"
+    exchange_out = exchange or "UNITED"
+    portfolio_out = portfolio or client_id
+    result: list[dict] = []
+    try:
+        snapshot = []
+        if hasattr(adapter, "get_positions_snapshot"):
+            snapshot = await adapter.get_positions_snapshot(inst_type=None)
+        elif hasattr(adapter, "get_positions"):
+            snapshot = await adapter.get_positions(inst_type=None)
+        for p in snapshot or []:
+            # фильтр валют (если нужно)
+            if withoutCurrency and p.get("isCurrency"):
+                continue
+            symbol = p.get("symbol")
+            qty_units = float(p.get("qtyUnits", 0) or 0)
+            avg_price = float(p.get("avgPrice", 0) or 0)
+            cur_price = p.get("currentPrice")
+            cur_price = float(cur_price) if cur_price is not None else None
+            # volume считаем ТОЛЬКО если можем
+            volume = None
+            if avg_price and qty_units:
+                volume = avg_price * qty_units
+            current_volume = None
+            if cur_price is not None and qty_units:
+                current_volume = cur_price * qty_units
+            result.append({
+                "volume": volume,
+                "currentVolume": current_volume,
+                "symbol": symbol,
+                "brokerSymbol": f"{exchange_out}:{symbol}",
+                "portfolio": "DEV_portfolio",
+                "exchange": exchange_out,
+                "avgPrice": avg_price,
+                "qtyUnits": qty_units,
+                "openUnits": 0,
+                "lotSize": float(p.get("lotSize", 0) or 0),
+                "shortName": p.get("shortName") or symbol,
+                "qtyT0": 0,
+                "qtyT1": 0,
+                "qtyT2": 0,
+                "qtyTFuture": 0,
+                "qtyT0Batch": 0,
+                "qtyT1Batch": 0,
+                "qtyT2Batch": 0,
+                "qtyTFutureBatch": 0,
+                "qtyBatch": 0,
+                "openQtyBatch": 0,
+                "qty": qty_units,
+                "open": 0,
+                "dailyUnrealisedPl": 0,
+                "unrealisedPl": 0,
+                "isCurrency": bool(p.get("isCurrency", False)),
+                "existing": True,  # REST = всегда snapshot
+            })
+    except Exception:
+        result = []
+    return JSONResponse(result)
+
+@app.get("/md/v2/Clients/{exchange}/{portfolio}/orders")
+async def md_client_orders(
+    exchange: str,
+    portfolio: str,
+):
+    result: list[dict] = []
+    try:
+        inst_types = ["SPOT", "FUTURES", "SWAP"]
+        # 1) история заявок
+        if hasattr(adapter, "get_orders_history"):
+            for it in inst_types:
+                history = await adapter.get_orders_history(
+                    inst_type=it,
+                    limit=100,
+                )
+                for o in history or []:
+                    result.append(
+                        _astras_order_simple_from_okx_neutral(
+                            o,
+                            exchange=exchange,
+                            portfolio=portfolio,
+                            existing=True,   # REST = snapshot
+                        )
+                    )
+        # 2) активные заявки (pending)
+        if hasattr(adapter, "get_orders_pending"):
+            for it in inst_types:
+                pending = await adapter.get_orders_pending(
+                    inst_type=it,
+                    inst_id=None,
+                )
+                for o in pending or []:
+                    result.append(
+                        _astras_order_simple_from_okx_neutral(
+                            o,
+                            exchange=exchange,
+                            portfolio=portfolio,
+                            existing=True,   # REST = snapshot
+                        )
+                    )
+    except Exception:
+        pass
+    return JSONResponse(result)
+
+@app.get("/md/v2/Clients/{exchange}/{portfolio}/trades")
+async def md_client_trades(
+    exchange: str,
+    portfolio: str,
+    format: str = "heavy",
+):
+    fmt = (format or "heavy").strip().lower()
+    if fmt not in ("heavy", "simple", "slim"):
+        fmt = "heavy"
+    result: list[dict] = []
+    try:
+        inst_types = ["SPOT", "FUTURES", "SWAP"]
+        if hasattr(adapter, "get_trades_history"):
+            for it in inst_types:
+                trades = await adapter.get_trades_history(inst_type=it, limit=100)
+                for t in trades or []:
+                    symbol = t.get("symbol") or t.get("instId") or "[N/A]"
+                    inst_id = t.get("instId") or t.get("inst_id") or t.get("symbol")
+                    currency = None
+                    if inst_id and "-" in str(inst_id):
+                        parts = [p for p in str(inst_id).split("-") if p]
+                        if len(parts) >= 2:
+                            currency = parts[1].strip() or None
+                    date_iso = t.get("date")
+                    if not date_iso:
+                        ts_ms = t.get("ts") or t.get("fillTime") or t.get("ts_fill")
+                        try:
+                            date_iso = _iso_from_unix_ms(int(ts_ms)) if ts_ms else None
+                        except Exception:
+                            date_iso = None
+                    price = t.get("price")
+                    qty_units = t.get("qtyUnits")
+                    if qty_units is None:
+                        qty_units = t.get("qty")
+
+                    try:
+                        qty_units_f = float(qty_units) if qty_units is not None else 0.0
+                    except Exception:
+                        qty_units_f = 0.0
+                    try:
+                        price_f = float(price) if price is not None else 0.0
+                    except Exception:
+                        price_f = 0.0
+
+                    volume = t.get("volume")
+                    value = t.get("value")
+                    if volume is None:
+                        volume = price_f * qty_units_f
+                    if value is None:
+                        value = volume
+                    board = t.get("board") or t.get("instType") or t.get("inst_type") or "0"
+                    result.append(
+                        {
+                            "id": str(t.get("id") or "0"),
+                            "orderNo": str(t.get("orderNo") or t.get("orderno") or t.get("orderId") or "0"),
+                            "comment": t.get("comment"),
+                            "symbol": symbol,
+                            "shortName": symbol,
+                            "brokerSymbol": f"{exchange}:{symbol}",
+                            "exchange": exchange,
+                            "date": date_iso,
+                            "board": board,
+                            "qtyUnits": qty_units_f,
+                            "qtyBatch": t.get("qtyBatch", 0) or 0,
+                            "qty": t.get("qty", qty_units_f),
+                            "price": price_f,
+                            "currency": currency,
+                            "accruedInt": t.get("accruedInt", 0) or 0,
+                            "side": t.get("side") or "0",
+                            "existing": bool(t.get("existing", True)),
+                            "commission": t.get("commission"),
+                            "repoSpecificFields": None,
+                            "volume": volume,
+                            "settleDate": t.get("settleDate"),  # пока null, не даёт OKX
+                            "value": value,
+                        }
+                    )
+    except Exception:
+        pass
+    return JSONResponse(result)
 
 @app.post("/identity/v5/UserSettings")
 @app.put("/identity/v5/UserSettings")
@@ -151,8 +340,22 @@ def all_portfolios(user_id: str):
     portfolio_id = "DEV_portfolio"
 
     return JSONResponse([
-        {
+            {
             "agreement": "39004",
+            "portfolio": "7500GHC",
+            "tks": "7500GHC",
+            "market": "Срочный рынок",
+            "isVirtual": False
+        },
+        {
+            "agreement": "61022",
+            "portfolio": "7500NVC",
+            "tks": "7500NVC",
+            "market": "Срочный рынок",
+            "isVirtual": False 
+        },
+        {
+            "agreement": "test",
             "portfolio": portfolio_id,
             "tks": portfolio_id,
             "market": "OKX",
@@ -728,7 +931,7 @@ def _astras_order_simple_from_okx_neutral(
         "id": o.get("id", "0"),
         "symbol": symbol,
         "brokerSymbol": broker_symbol,
-        "portfolio": portfolio,
+        "portfolio": "DEV_portfolio",
         "exchange": exchange,
 
         # comment по схеме string/null, у OKX нет комментария -> null
@@ -2180,79 +2383,61 @@ async def stream(ws: WebSocket):
 
                 continue
 
-            # все сделки по портфелю (Astras Simple)
+            # все сделки по портфелю (Astras Heavy)
             if opcode == "TradesGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["fills"].append(stop)
-
                 portfolio = msg.get("portfolio")  # у OKX виртуальный
                 exchange_out = "OKX"
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
-
                 # если Astras переиспользовал guid — остановим старую подписку
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
-
                 subs[sub_guid] = stop
 
                 async def send_trade_astras(t: dict, existing_flag: bool, _guid: str):
                     ts_ms = int(t.get("ts", 0) or 0)
                     date_iso = _iso_from_unix_ms(ts_ms) if ts_ms else None
-
                     symbol = t.get("symbol") or "N/A"
                     qty = float(t.get("qty", 0) or 0)
                     price = float(t.get("price", 0) or 0)
-
                     payload = {
                         "id": str(t.get("id", "0")),
                         "orderno": str(t.get("orderno", "0")),
                         "comment": None,
-
                         "symbol": symbol,
                         "brokerSymbol": symbol,
                         "exchange": exchange_out,
-
                         "date": date_iso,
-                        "board": None,  # у OKX нет board
-
-                        # Astras Simple
+                        "board": None,
                         "qtyUnits": 0,
                         "qtyBatch": 0,
                         "qty": qty,
-
                         "price": price,
                         "accruedInt": 0,
-
                         "side": t.get("side", "0"),
-
                         "existing": bool(existing_flag),
-
                         "commission": t.get("commission", 0) or 0,
                         "repoSpecificFields": None,
-
-                        # volume / value = price * qty
-                        "volume": t.get("volume", 0) or 0,
+                        "settleDate": None,
+                        "volume": t.get("volume", 0) or 0, # volume / value = price * qty
                         "value": 0,
                     }
-
                     await safe_send_json({"data": payload, "guid": _guid})
-
                 # события подписки OKX
                 subscribed_evt = asyncio.Event()
                 error_evt = asyncio.Event()
-
                 history_done = False
                 live_buffer: list[dict] = []
 
                 def _on_subscribed(_ev: dict):
                     subscribed_evt.set()
-
                 def _on_error(ev: dict):
                     error_evt.set()
                     return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
-
+                
                 async def _on_live_trade(tr: dict, _guid: str):
                     nonlocal history_done
                     if not history_done:
@@ -2303,7 +2488,7 @@ async def stream(ws: WebSocket):
                 stop = asyncio.Event()
                 active["positions"].append(stop)
 
-                exchange_out = "OKX"
+                exchange_out = "UNITED"
                 portfolio = msg.get("portfolio") or "0"
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
@@ -2320,27 +2505,36 @@ async def stream(ws: WebSocket):
                 async def send_pos_astras(p: dict, existing_flag: bool, _guid: str):
                     symbol = p.get("symbol")
 
-                    qty_units = float(p.get("qtyUnits", 0) or 0)
-                    avg_price = float(p.get("avgPrice", 0) or 0)
-                    cur_price = p.get("currentPrice")
-                    cur_price = float(cur_price) if cur_price is not None else 0.0
+                    # qtyUnits/avgPrice могут отсутствовать у OKX; тогда оставляем 0
+                    qty_units_raw = p.get("qtyUnits")
+                    avg_price_raw = p.get("avgPrice")
 
-                    volume = p.get("volume")
-                    current_volume = p.get("currentVolume")
-                    volume = float(volume) if volume is not None else (avg_price * qty_units)
-                    current_volume = float(current_volume) if current_volume is not None else (cur_price * qty_units)
+                    qty_units = float(qty_units_raw) if qty_units_raw is not None else 0.0
+                    avg_price = float(avg_price_raw) if avg_price_raw is not None else 0.0
+
+                    # volume/currentVolume: если OKX не дал — НЕ подставляем 0.0
+                    # volume можем посчитать как avgPrice * qtyUnits, только если оба реально пришли
+                    vol_raw = p.get("volume")
+                    cur_vol_raw = p.get("currentVolume")
+
+                    if vol_raw is not None:
+                        volume = float(vol_raw)
+                    elif qty_units_raw is not None and avg_price_raw is not None:
+                        volume = float(avg_price_raw) * float(qty_units_raw)
+                    else:
+                        volume = None
+
+                    current_volume = float(cur_vol_raw) if cur_vol_raw is not None else None
 
                     payload = {
                         "volume": volume,
                         "currentVolume": current_volume,
 
                         "symbol": symbol,
-                        "brokerSymbol": symbol,
-                        "portfolio": portfolio,
+                        "brokerSymbol": f"{exchange_out}:{symbol}",
+                        "portfolio": "DEV_portfolio",
                         "exchange": exchange_out,
-
                         "avgPrice": avg_price,
-
                         "qtyUnits": qty_units,
                         "openUnits": 0,
                         "lotSize": float(p.get("lotSize", 0) or 0),

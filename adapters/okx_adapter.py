@@ -913,7 +913,6 @@ class OkxAdapter:
         out.sort(key=lambda x: int(x.get("ts_update", 0) or 0))
         return out
 
-
     #REST: история заявок (orders-history)
     async def get_orders_history(
         self,
@@ -1265,10 +1264,8 @@ class OkxAdapter:
     ) -> List[Dict[str, Any]]:
         """
         Возвращает список исполнений в нейтральном формате.
-
         OKX endpoint: /trade/fills-history
         Возвращает историю за последние 3 месяца.
-
         Важно:
         - В запросе Astras TradesGetAndSubscribeV2 нет instType.
           Если inst_type=None — считаем, что нужно взять историю по всему аккаунту,
@@ -1930,10 +1927,10 @@ class OkxAdapter:
                 {
                     "symbol": ccy,
                     "qtyUnits": qty,
-                    "avgPrice": 0.0,
-                    "currentPrice": 0.0,
-                    "volume": 0.0,
-                    "currentVolume": 0.0,
+                    "avgPrice": None,
+                    "currentPrice": None,
+                    "volume": None,
+                    "currentVolume": None,
                     "lotSize": 0.0,
                     "shortName": ccy,
                     "isCurrency": True,
@@ -1953,8 +1950,8 @@ class OkxAdapter:
             cur_px_raw = d.get("last")
         cur_px = self._to_float(cur_px_raw)
 
-        vol = avg_px * pos
-        cur_vol = cur_px * pos
+        vol = (avg_px * pos) if avg_px > 0 else None
+        cur_vol = (cur_px * pos) if cur_px > 0 else None
 
         return {
             "symbol": inst_id,
@@ -1971,33 +1968,36 @@ class OkxAdapter:
     async def get_positions_snapshot(self, inst_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Snapshot positions for Astras PositionsGetAndSubscribeV2.
 
-        - SPOT: uses /account/balance -> currency balances (isCurrency=True)
-        - FUTURES/SWAP: uses /account/positions -> instrument positions (isCurrency=False)
+        Всегда возвращает:
+        - SPOT: валютные остатки (account/balance)
+        - FUTURES + SWAP: позиции по инструментам (account/positions)
 
-        Returns a neutral list of dicts that server.py maps to Astras Simple.
+        inst_type из Astras игнорируется — по нашей схеме всегда отдаём все 3 типа.
         """
-        inst_type_s = (str(inst_type).strip().upper() if inst_type else "SPOT")
 
         out: List[Dict[str, Any]] = []
 
-        # 1) Currency balances (SPOT cash) — always safe to return
+        # 1) SPOT — валютные остатки
         try:
             bal = await self._request_private("GET", "/account/balance")
             data = bal.get("data") or []
             if data:
                 out.extend(self._parse_okx_account_balance_any(data[0] or {}))
         except Exception:
-            # If account/balance fails, return empty snapshot.
             pass
 
-        # 2) Derivatives positions (FUTURES/SWAP)
-        if inst_type_s in ("FUTURES", "SWAP"):
+        # 2) FUTURES и SWAP — позиции по деривативам
+        for itype in ("FUTURES", "SWAP"):
             try:
-                pos = await self._request_private("GET", "/account/positions", params={"instType": inst_type_s})
+                pos = await self._request_private(
+                    "GET",
+                    "/account/positions",
+                    params={"instType": itype},
+                )
                 for it in (pos.get("data") or []):
                     out.append(self._parse_okx_position_any(it or {}))
             except Exception:
-                pass
+                continue
 
         return out
 
@@ -2199,16 +2199,10 @@ class OkxAdapter:
         }
 
     async def get_summaries_snapshot(self) -> Dict[str, Any]:
-        """Snapshot для SummariesGetAndSubscribeV2 (нейтральный формат).
-
-        Берём /api/v5/account/balance и возвращаем нейтральные OKX-поля.
-        Формат Astras собирается в server.py.
-        """
         raw = await self._request_private("GET", "/account/balance")
         data = raw.get("data") or []
         if not data:
             raise RuntimeError("OKX /account/balance returned empty data")
-
         return self._parse_okx_account_summary_any(data[0] or {})
 
     async def subscribe_summaries(
