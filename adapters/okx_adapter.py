@@ -1176,6 +1176,121 @@ class OkxAdapter:
                     "sMsg": s_msg,
                 }
 
+    #WS: выставление лимитной заявки (limit/ioc/fok/post_only) через private WS op=order
+    async def place_limit_order_ws(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Any,
+        price: Any,
+        inst_type: str = "SPOT",
+        td_mode: Optional[str] = None,
+        pos_side: Optional[str] = None,
+        ord_type: Optional[str] = None,
+        cl_ord_id: Optional[str] = None,
+        ccy: Optional[str] = None,
+        tif: Optional[str] = None,
+        ws_request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Выставляет лимитную заявку через OKX WS private (op=order).
+        Возвращает нейтральный результат: ordId/clOrdId/sCode/sMsg.
+        """
+
+        inst_id = symbol
+        side_s = str(side or "").lower().strip()
+
+        def _fmt_num(x: Any) -> str:
+            try:
+                f = float(x)
+            except Exception:
+                return "" if x is None else str(x)
+            s = f"{f:.16f}".rstrip("0").rstrip(".")
+            return s if s else "0"
+
+        if td_mode is None:
+            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
+
+        ord_type_s = (ord_type or "limit").lower().strip()
+        if ord_type_s not in ("limit", "post_only", "ioc", "fok"):
+            raise ValueError("ord_type must be one of: limit, post_only, ioc, fok")
+
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side_s,
+            "ordType": ord_type_s,
+            "sz": _fmt_num(quantity),
+            "px": _fmt_num(price),
+        }
+        if cl_ord_id:
+            body["clOrdId"] = str(cl_ord_id)
+        if pos_side:
+            body["posSide"] = str(pos_side)
+        if ccy:
+            body["ccy"] = str(ccy)
+        if tif:
+            body["tif"] = str(tif)
+
+        req_id = str(ws_request_id or cl_ord_id or f"order-{uuid.uuid4().hex}")
+        login_msg = self._ws_login_payload()
+        order_msg = {"id": req_id, "op": "order", "args": [body]}
+
+        async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
+            await ws.send(json.dumps(login_msg))
+
+            authed = False
+            login_deadline = asyncio.get_event_loop().time() + 5.0
+            while not authed:
+                if asyncio.get_event_loop().time() > login_deadline:
+                    raise RuntimeError("OKX WS login timeout")
+
+                raw = await ws.recv()
+                msg = json.loads(raw)
+
+                if msg.get("event") == "error":
+                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
+
+                if msg.get("event") == "login":
+                    if msg.get("code") == "0":
+                        authed = True
+                        break
+                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
+
+            await ws.send(json.dumps(order_msg))
+
+            resp_deadline = asyncio.get_event_loop().time() + 5.0
+            while True:
+                if asyncio.get_event_loop().time() > resp_deadline:
+                    raise RuntimeError("OKX WS order timeout")
+
+                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                msg = json.loads(raw)
+
+                if msg.get("id") != req_id:
+                    continue
+
+                code = str(msg.get("code") or "")
+                if code and code != "0":
+                    raise RuntimeError(f"OKX WS order error {code}: {msg.get('msg')}")
+
+                items = msg.get("data") or []
+                if not items:
+                    raise RuntimeError("OKX WS order: empty response data")
+
+                it0 = items[0] or {}
+                s_code = str(it0.get("sCode") or "")
+                s_msg = str(it0.get("sMsg") or "")
+                if s_code and s_code != "0":
+                    raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
+
+                return {
+                    "ordId": str(it0.get("ordId") or "0"),
+                    "clOrdId": str(it0.get("clOrdId") or ""),
+                    "sCode": s_code or "0",
+                    "sMsg": s_msg,
+                }
+
     #REST: выставление лимитной заявки (limit order)
     async def place_limit_order(
         self,

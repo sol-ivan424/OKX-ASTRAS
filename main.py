@@ -4,4 +4,4 @@ if __name__ == "__main__":
     uvicorn.run("api.server:app", host="0.0.0.0", port=8080, reload=True)
 
 
-    #ver 16.11.2025 1.16
+    #ver 0.1

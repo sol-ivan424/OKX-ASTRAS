@@ -975,6 +975,8 @@ SUPPORTED_BOARDS = ["SPOT", "FUTURES", "SWAP"]
 _ORDER_IDEMPOTENCY: dict[str, dict] = {} # cache for market orders: X-REQID -> response json
 _ORDER_IDEMPOTENCY_LIMIT: dict[str, dict] = {} # limit
 _ORDER_IDEMPOTENCY_STOP: dict[str, dict] = {} # stop
+_CWS_MARKET_IDEMPOTENCY: dict[str, dict] = {} # create:market (CWS): guid -> response json
+_CWS_LIMIT_IDEMPOTENCY: dict[str, dict] = {} # create:limit (CWS): guid -> response json
 
 async def _load_ticker_map_for_types(inst_types: list[str]) -> dict[str, dict]:
     results = await asyncio.gather(
@@ -1554,8 +1556,8 @@ async def create_stop_order(request: Request):
     _ORDER_IDEMPOTENCY_STOP[x_reqid] = out
     return out
 
-@app.websocket("/stream")
-async def stream(ws: WebSocket):
+@app.websocket("/ws")
+async def ws_stream(ws: WebSocket):
     try:
         await ws.accept()
     except Exception:
@@ -1587,8 +1589,6 @@ async def stream(ws: WebSocket):
     
     # guid -> stop_event (чтобы уметь корректно отписываться)
     subs: dict[str, asyncio.Event] = {}
-    # guid -> response (idempotency for WS create:market)
-    ws_market_idempotency: dict[str, dict] = {}
     # throttling per subscription guid (frequency in ms)
     last_sent_ms_book: dict[str, int] = {}
     last_sent_ms_quotes: dict[str, int] = {}
@@ -2685,16 +2685,105 @@ async def stream(ws: WebSocket):
 
                 continue
 
-            # создание рыночной заявки (Astras WS: create:market)
-            if opcode == "create:market": #timeInForce не поддерживается
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # остановить все активные подписки, чтобы адаптер прекратил коллбеки
+        for lst in active.values():
+            for ev in lst:
+                ev.set()
+
+        # остановить подписки, которые храним по guid (unsubscribe-механизм)
+        for ev in subs.values():
+            try:
+                ev.set()
+            except Exception:
+                pass
+        subs.clear()
+
+
+@app.websocket("/cws")
+async def cws_stream(ws: WebSocket):
+    try:
+        await ws.accept()
+    except Exception:
+        return
+
+    async def safe_send_json(payload: dict):
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            return
+
+    async def send_error_and_close(guid: str | None, http_code: int, message: str):
+        try:
+            await safe_send_json(
+                {
+                    "message": message,
+                    "httpCode": http_code,
+                    "requestGuid": guid,
+                }
+            )
+        finally:
+            await ws.close()
+
+    try:
+        while True:
+            try:
+                msg = await ws.receive_json()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+            except Exception:
+                break
+
+            opcode = msg.get("opcode")
+            token = msg.get("token")
+            req_guid = msg.get("guid")
+
+            if opcode == "authorize":
+                auth_guid = msg.get("guid") or req_guid
+                await safe_send_json(
+                    {
+                        "requestGuid": auth_guid,
+                        "httpCode": 200,
+                        "message": "The connection has been initialized.",
+                    }
+                )
+                continue
+
+            if opcode == "ping":
+                ping_guid = msg.get("guid")
+                await safe_send_json({
+                    "opcode": "ping",
+                    "guid": ping_guid,
+                    "confirm": True,
+                })
+                continue
+
+            if opcode and (not isinstance(token, str) or not token.strip()):
+                await safe_send_json(
+                    {
+                        "data": {
+                            "error": "TokenRequired",
+                            "message": "Field 'token' is required for opcode requests",
+                        },
+                        "guid": req_guid or msg.get("guid"),
+                    }
+                )
+                continue
+
+            # создание рыночной заявки (Astras CWS: create:market)
+            if opcode == "create:market":  # timeInForce не поддерживается
                 order_guid = msg.get("guid") or req_guid
                 if not order_guid:
                     await send_error_and_close(None, 400, "guid is required")
                     raise WebSocketDisconnect
 
                 check_duplicates = msg.get("checkDuplicates", True)
-                if bool(check_duplicates) and order_guid in ws_market_idempotency:
-                    await safe_send_json(ws_market_idempotency[order_guid])
+                if bool(check_duplicates) and order_guid in _CWS_MARKET_IDEMPOTENCY:
+                    await safe_send_json(_CWS_MARKET_IDEMPOTENCY[order_guid])
                     continue
 
                 side = (msg.get("side") or "").lower()
@@ -2732,23 +2821,87 @@ async def stream(ws: WebSocket):
                     "orderNumber": ord_id,
                 }
                 if bool(check_duplicates):
-                    ws_market_idempotency[order_guid] = out
+                    _CWS_MARKET_IDEMPOTENCY[order_guid] = out
+
+                await safe_send_json(out)
+                continue
+
+            # создание лимитной заявки (Astras CWS: create:limit)
+            if opcode == "create:limit":
+                order_guid = msg.get("guid") or req_guid
+                if not order_guid:
+                    await send_error_and_close(None, 400, "guid is required")
+                    raise WebSocketDisconnect
+
+                check_duplicates = msg.get("checkDuplicates", True)
+                if bool(check_duplicates) and order_guid in _CWS_LIMIT_IDEMPOTENCY:
+                    await safe_send_json(_CWS_LIMIT_IDEMPOTENCY[order_guid])
+                    continue
+
+                side = (msg.get("side") or "").lower()
+                qty = msg.get("quantity")
+                price = msg.get("price")
+                instr = msg.get("instrument") or {}
+                symbol = instr.get("symbol")
+                inst_type = instr.get("instrumentGroup") or instr.get("board")
+                allow_margin = bool(msg.get("allowMargin", False))
+                inst_type_s = str(inst_type).strip().upper() if inst_type is not None else ""
+
+                tif = str(msg.get("timeInForce") or "OneDay").lower()
+                if tif in ("oneday", "goodtillcancelled"):
+                    okx_ord_type = "limit"
+                elif tif == "immediateorcancel":
+                    okx_ord_type = "ioc"
+                elif tif == "fillorkill":
+                    okx_ord_type = "fok"
+                elif tif == "bookorcancel":
+                    okx_ord_type = "post_only"
+                elif tif == "attheclose":
+                    await send_error_and_close(order_guid, 400, "timeInForce attheclose is not supported for OKX")
+                    raise WebSocketDisconnect
+                else:
+                    await send_error_and_close(order_guid, 400, f"Unsupported timeInForce: {tif}")
+                    raise WebSocketDisconnect
+
+                if inst_type_s in ("FUTURES", "SWAP"):
+                    td_mode = "cross"
+                elif inst_type_s == "SPOT":
+                    td_mode = "cross" if allow_margin else "cash"
+                else:
+                    td_mode = "cross" if allow_margin else "cash"
+
+                try:
+                    res = await adapter.place_limit_order_ws(
+                        symbol=symbol,
+                        side=side,
+                        quantity=qty,
+                        price=price,
+                        inst_type=inst_type_s,
+                        ord_type=okx_ord_type,
+                        td_mode=td_mode,
+                        cl_ord_id=order_guid,
+                    )
+                except Exception as e:
+                    await send_error_and_close(order_guid, 502, str(e))
+                    raise WebSocketDisconnect
+
+                ord_id = str(res.get("ordId") or "0")
+                out = {
+                    "requestGuid": order_guid,
+                    "httpCode": 200,
+                    "message": f"An order '{ord_id}' has been created.",
+                    "orderNumber": ord_id,
+                }
+                if bool(check_duplicates):
+                    _CWS_LIMIT_IDEMPOTENCY[order_guid] = out
 
                 await safe_send_json(out)
                 continue
 
     except WebSocketDisconnect:
         pass
-    finally:
-        # остановить все активные подписки, чтобы адаптер прекратил коллбеки
-        for lst in active.values():
-            for ev in lst:
-                ev.set()
 
-        # остановить подписки, которые храним по guid (unsubscribe-механизм)
-        for ev in subs.values():
-            try:
-                ev.set()
-            except Exception:
-                pass
-        subs.clear()
+
+@app.websocket("/stream")
+async def stream_alias(ws: WebSocket):
+    await ws_stream(ws)
