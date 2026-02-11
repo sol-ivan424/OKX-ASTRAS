@@ -5,6 +5,7 @@ import hmac
 import base64
 import hashlib
 import asyncio
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Callable
 from urllib.parse import urlencode
@@ -42,15 +43,6 @@ class OkxAdapter:
             else:
                 # установка/обновление уровня
                 side_state[price] = sz
-    """
-    Адаптер OKX.
-
-    Содержит:
-    - публичные REST-запросы (например, список инструментов)
-    - приватные REST-запросы с подписью (например, проверка API-ключей)
-    - публичные WS-подписки (например, свечи)
-    - приватные WS-подписки (например, заявки)
-    """
 
     #инициализация адаптера
     def __init__(
@@ -683,6 +675,7 @@ class OkxAdapter:
         stop_event: asyncio.Event,
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         #публичный WS (public) для свечей
         channel = self._tf_to_okx_ws_channel(tf)
@@ -691,6 +684,7 @@ class OkxAdapter:
             "op": "subscribe",
             "args": [{"channel": channel, "instId": symbol}],
         }
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -731,6 +725,9 @@ class OkxAdapter:
                             if asyncio.iscoroutine(res):
                                 await res
 
+                    if stop_event.is_set() and subscribed_sent:
+                        await self._ws_unsubscribe(ws, unsub_args)
+
             except Exception:
                 await asyncio.sleep(1.0)
                 continue
@@ -760,6 +757,14 @@ class OkxAdapter:
                 }
             ],
         }
+
+    async def _ws_unsubscribe(self, ws, args: Optional[List[Dict[str, Any]]]) -> None:
+        if not args:
+            return
+        try:
+            await ws.send(json.dumps({"op": "unsubscribe", "args": args}))
+        except Exception:
+            return
 
     #парсер ордера OKX (REST и WS) в нейтральный формат
     def _parse_okx_order_any(self, d: Dict[str, Any]) -> Dict[str, Any]:
@@ -1059,6 +1064,118 @@ class OkxAdapter:
             "sMsg": s_msg,
         }
 
+    #WS: выставление рыночной заявки (market order) через private WS op=order
+    async def place_market_order_ws(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Any,
+        inst_type: str = "SPOT",
+        td_mode: Optional[str] = None,
+        pos_side: Optional[str] = None,
+        tgt_ccy: Optional[str] = None,
+        cl_ord_id: Optional[str] = None,
+        ccy: Optional[str] = None,
+        tif: Optional[str] = None,
+        ws_request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Выставляет рыночную заявку через OKX WS private (op=order).
+        Возвращает нейтральный результат: ordId/clOrdId/sCode/sMsg.
+        """
+
+        inst_id = symbol
+        side_s = str(side or "").lower().strip()
+
+        def _fmt_sz(x: Any) -> str:
+            try:
+                f = float(x)
+            except Exception:
+                return "" if x is None else str(x)
+            s = f"{f:.16f}".rstrip("0").rstrip(".")
+            return s if s else "0"
+
+        # tdMode: SPOT без маржи -> cash, деривативы/маржа -> cross
+        if td_mode is None:
+            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
+
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side_s,
+            "ordType": "market",
+            "sz": _fmt_sz(quantity),
+        }
+        if cl_ord_id:
+            body["clOrdId"] = str(cl_ord_id)
+        if pos_side:
+            body["posSide"] = str(pos_side)
+        if tgt_ccy:
+            body["tgtCcy"] = str(tgt_ccy)
+        if ccy:
+            body["ccy"] = str(ccy)
+        if tif:
+            body["tif"] = str(tif)
+
+        req_id = str(ws_request_id or cl_ord_id or f"order-{uuid.uuid4().hex}")
+        login_msg = self._ws_login_payload()
+        order_msg = {"id": req_id, "op": "order", "args": [body]}
+
+        async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
+            await ws.send(json.dumps(login_msg))
+
+            authed = False
+            login_deadline = asyncio.get_event_loop().time() + 5.0
+            while not authed:
+                if asyncio.get_event_loop().time() > login_deadline:
+                    raise RuntimeError("OKX WS login timeout")
+
+                raw = await ws.recv()
+                msg = json.loads(raw)
+
+                if msg.get("event") == "error":
+                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
+
+                if msg.get("event") == "login":
+                    if msg.get("code") == "0":
+                        authed = True
+                        break
+                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
+
+            await ws.send(json.dumps(order_msg))
+
+            resp_deadline = asyncio.get_event_loop().time() + 5.0
+            while True:
+                if asyncio.get_event_loop().time() > resp_deadline:
+                    raise RuntimeError("OKX WS order timeout")
+
+                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                msg = json.loads(raw)
+
+                if msg.get("id") != req_id:
+                    continue
+
+                code = str(msg.get("code") or "")
+                if code and code != "0":
+                    raise RuntimeError(f"OKX WS order error {code}: {msg.get('msg')}")
+
+                items = msg.get("data") or []
+                if not items:
+                    raise RuntimeError("OKX WS order: empty response data")
+
+                it0 = items[0] or {}
+                s_code = str(it0.get("sCode") or "")
+                s_msg = str(it0.get("sMsg") or "")
+                if s_code and s_code != "0":
+                    raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
+
+                return {
+                    "ordId": str(it0.get("ordId") or "0"),
+                    "clOrdId": str(it0.get("clOrdId") or ""),
+                    "sCode": s_code or "0",
+                    "sMsg": s_msg,
+                }
+
     #REST: выставление лимитной заявки (limit order)
     async def place_limit_order(
         self,
@@ -1311,6 +1428,7 @@ class OkxAdapter:
         inst_type: str = "SPOT",
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         login_msg = self._ws_login_payload()
 
@@ -1325,6 +1443,7 @@ class OkxAdapter:
             sub_args_list.append({"channel": "orders", "instType": it})
 
         sub_msg = {"op": "subscribe", "args": sub_args_list}
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -1399,6 +1518,9 @@ class OkxAdapter:
                             if asyncio.iscoroutine(res):
                                 await res
 
+                    if stop_event.is_set() and subscribed_sent:
+                        await self._ws_unsubscribe(ws, unsub_args)
+
             except Exception as e:
                 # если произошла нештатная ошибка до подтверждения подписки — пробрасываем наружу
                 if on_error is not None:
@@ -1419,6 +1541,7 @@ class OkxAdapter:
         inst_type: str = "SPOT",
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Подписка на сделки (исполнения) OKX через приватный WS.
@@ -1443,6 +1566,7 @@ class OkxAdapter:
             sub_args_list.append({"channel": "orders", "instType": it})
 
         sub_msg = {"op": "subscribe", "args": sub_args_list}
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -1527,6 +1651,9 @@ class OkxAdapter:
                             if asyncio.iscoroutine(res):
                                 await res
 
+                    if stop_event.is_set() and subscribed_sent:
+                        await self._ws_unsubscribe(ws, unsub_args)
+
             except Exception as e:
                 # если произошла нештатная ошибка до подтверждения подписки — пробрасываем наружу
                 if on_error is not None:
@@ -1548,6 +1675,7 @@ class OkxAdapter:
         stop_event: asyncio.Event,
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Подписка на стакан OKX.
@@ -1573,6 +1701,7 @@ class OkxAdapter:
                 }
             ],
         }
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -1646,6 +1775,9 @@ class OkxAdapter:
                             if asyncio.iscoroutine(res):
                                 await res
 
+                    if stop_event.is_set() and subscribed_sent:
+                        await self._ws_unsubscribe(ws, unsub_args)
+
             except Exception:
                 await asyncio.sleep(1.0)
                 continue
@@ -1658,6 +1790,7 @@ class OkxAdapter:
         stop_event: asyncio.Event,
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Подписка на котировки OKX через WS tickers.
@@ -1685,6 +1818,7 @@ class OkxAdapter:
                 }
             ],
         }
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -1724,6 +1858,9 @@ class OkxAdapter:
                             res = on_data(t)
                             if asyncio.iscoroutine(res):
                                 await res
+
+                    if stop_event.is_set() and subscribed_sent:
+                        await self._ws_unsubscribe(ws, unsub_args)
 
             except Exception:
                 await asyncio.sleep(1.0)
@@ -1792,6 +1929,7 @@ class OkxAdapter:
         inst_type: str = "SPOT",
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         OKX private WS:
@@ -1813,6 +1951,7 @@ class OkxAdapter:
             args.append({"channel": "positions", "instType": inst_type_u})
 
         sub_msg = {"op": "subscribe", "args": args}
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -1898,6 +2037,9 @@ class OkxAdapter:
                             res = on_data(item)
                             if asyncio.iscoroutine(res):
                                 await res
+
+                    if stop_event.is_set() and subscribed:
+                        await self._ws_unsubscribe(ws, unsub_args)
 
             except Exception as e:
                 if on_error:
@@ -2008,6 +2150,7 @@ class OkxAdapter:
         inst_type: Optional[str] = None,
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Private WS subscribe for positions.
 
@@ -2041,6 +2184,7 @@ class OkxAdapter:
             sub_args.append({"channel": "positions", "instType": inst_type_s})
 
         sub_msg = {"op": "subscribe", "args": sub_args}
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -2152,6 +2296,9 @@ class OkxAdapter:
                                     await r
                             continue
 
+                    if stop_event.is_set() and subscribed:
+                        await self._ws_unsubscribe(ws, unsub_args)
+
             except Exception as e:
                 await _call(on_error, {"event": "error", "msg": str(e)})
                 await asyncio.sleep(1.0)
@@ -2159,25 +2306,10 @@ class OkxAdapter:
     
     # Summaries (сводная информация по "портфелю" = аккаунту OKX)
     def _parse_okx_account_summary_any(self, acc: Dict[str, Any]) -> Dict[str, Any]:
-        """OKX /account/balance (data[0]) -> нейтральная сводка (OKX-поля).
-
-        Важно: НЕ формируем формат Astras здесь.
-        Здесь возвращаем только то, что реально есть в OKX, чтобы server.py сам собрал ответ Astras.
-
-        Нейтральный формат:
-        {
-          "totalEq": float,
-          "availEq": float,
-          "imr": float,
-          "mmr": float,
-          "byCcy": [ {"ccy": str, "availEq": float}, ... ]
-        }
-        """
         total_eq = self._to_float(acc.get("totalEq"))
         avail_eq = self._to_float(acc.get("availEq"))
         imr = self._to_float(acc.get("imr"))
         mmr = self._to_float(acc.get("mmr"))
-
         by_ccy: List[Dict[str, Any]] = []
         for d in (acc.get("details") or []):
             ccy = (d.get("ccy") or "").strip()
@@ -2189,7 +2321,6 @@ class OkxAdapter:
                     "availEq": self._to_float(d.get("availEq")),
                 }
             )
-
         return {
             "totalEq": total_eq,
             "availEq": avail_eq,
@@ -2211,6 +2342,7 @@ class OkxAdapter:
         stop_event: asyncio.Event,
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Live-подписка для Summaries (нейтральный формат) через OKX private WS channel=account.
 
@@ -2232,6 +2364,7 @@ class OkxAdapter:
 
         login_msg = self._ws_login_payload()
         sub_msg = {"op": "subscribe", "args": [{"channel": "account"}]}
+        unsub_args = unsub_args or sub_msg.get("args")
 
         while not stop_event.is_set():
             try:
@@ -2325,6 +2458,9 @@ class OkxAdapter:
                         r = on_data(summary)
                         if asyncio.iscoroutine(r):
                             await r
+
+                    if stop_event.is_set() and subscribed:
+                        await self._ws_unsubscribe(ws, unsub_args)
 
             except Exception as e:
                 await _call(on_error, {"event": "error", "msg": str(e)})

@@ -11,18 +11,6 @@ from adapters.okx_adapter import OkxAdapter
 from dotenv import load_dotenv
 load_dotenv()
 
-"""
-def _astras_error(request_guid: str | None, http_code: int, message: str, status_code: int | None = None):
-    return JSONResponse(
-        {
-            "requestGuid": request_guid or "",
-            "httpCode": int(http_code),
-            "message": str(message),
-        },
-        status_code=int(status_code if status_code is not None else http_code),
-    )
-"""
-
 def _make_adapter():
     name = os.getenv("ADAPTER", "okx").lower()
 
@@ -71,41 +59,6 @@ def user_settings(serviceName: str = Query(default="Astras"), key: str | None = 
 def widget_settings(serviceName: str = Query(default="Astras")):
     # Пустой набор настроек виджетов
     return JSONResponse([])
-
-@app.get("/md/v2/Clients/{exchange}/{portfolio}/summary")
-async def md_client_summary(exchange: str, portfolio: str):
-    snap = await adapter.get_summaries_snapshot()
-
-    total_eq = float((snap or {}).get("totalEq", 0) or 0)
-    avail_eq = float((snap or {}).get("availEq", 0) or 0)
-    imr = float((snap or {}).get("imr", 0) or 0)
-
-    by_ccy = (snap or {}).get("byCcy") or []
-    buying_power_by_ccy = []
-    for x in by_ccy:
-        ccy = x.get("ccy")
-        if not ccy:
-            continue
-        buying_power_by_ccy.append({
-            "currency": str(ccy),
-            "buyingPower": float(x.get("availEq", 0) or 0),
-        })
-
-    payload = {
-        "buyingPowerAtMorning": 0,
-        "buyingPower": avail_eq,
-        "profit": 0,
-        "profitRate": 0,
-        "portfolioEvaluation": total_eq,
-        "portfolioLiquidationValue": total_eq,
-        "initialMargin": imr,
-        "correctedMargin": imr,
-        "riskBeforeForcePositionClosing": 0,
-        "commission": 0,
-        "buyingPowerByCurrency": buying_power_by_ccy,
-    }
-
-    return JSONResponse(payload)
 
 @app.get("/md/v2/clients/{client_id}/positions")
 async def md_client_positions(
@@ -336,12 +289,26 @@ def all_portfolios(user_id: str):
     portfolio_id = "DEV_portfolio"
 
     return JSONResponse([
+            {
+            "agreement": "39004",
+            "portfolio": "7500GHC",
+            "tks": "7500GHC",
+            "market": "Срочный рынок",
+            "isVirtual": False
+        },
         {
-            "agreement": "424",
+            "agreement": "61022",
+            "portfolio": "7500NVC",
+            "tks": "7500NVC",
+            "market": "Срочный рынок",
+            "isVirtual": False 
+        },
+        {
+            "agreement": "test",
             "portfolio": portfolio_id,
             "tks": portfolio_id,
             "market": "OKX",
-            "isVirtual": False,
+            "isVirtual": True,
         }
     ])
 
@@ -1569,11 +1536,6 @@ async def stream(ws: WebSocket):
         except Exception:
             return
 
-    """await safe_send_json({
-        "message": "Connected",
-        "httpCode": 200,
-    })"""
-
     active: dict[str, list[asyncio.Event]] = {
         "instruments": [],   # пока не используются в opcode
         "quotes": [],
@@ -1587,8 +1549,7 @@ async def stream(ws: WebSocket):
     
     # guid -> stop_event (чтобы уметь корректно отписываться)
     subs: dict[str, asyncio.Event] = {}
-    # guid -> response (idempotency for WS create:market)
-    ws_market_idempotency: dict[str, dict] = {}
+
     # throttling per subscription guid (frequency in ms)
     last_sent_ms_book: dict[str, int] = {}
     last_sent_ms_quotes: dict[str, int] = {}
@@ -1807,10 +1768,6 @@ async def stream(ws: WebSocket):
                     })
 
                 if code:
-                    unsub_args = [{
-                        "channel": adapter._tf_to_okx_ws_channel(tf),
-                        "instId": code,
-                    }]
                     # запускаем подписку и ждём подтверждение/ошибку от OKX 
                     subscribed_evt = asyncio.Event()
                     error_evt = asyncio.Event()
@@ -1846,7 +1803,6 @@ async def stream(ws: WebSocket):
                             stop_event=stop,
                             on_subscribed=_on_subscribed,
                             on_error=_on_error,
-                            unsub_args=unsub_args,
                         )
                     )
 
@@ -1965,8 +1921,6 @@ async def stream(ws: WebSocket):
                 inst_type_msg = msg.get("instrumentGroup") or msg.get("board")
                 inst_type_ws = str(inst_type_msg).strip().upper() if inst_type_msg else ""
                 inst_type_rest = str(inst_type_msg).strip().upper() if inst_type_msg else None
-                inst_types_ws = [inst_type_ws] if inst_type_ws in ("SPOT", "SWAP", "FUTURES") else ["SPOT", "SWAP", "FUTURES"]
-                unsub_args = [{"channel": "orders", "instType": it} for it in inst_types_ws]
 
                 asyncio.create_task(
                     adapter.subscribe_orders(
@@ -1976,7 +1930,6 @@ async def stream(ws: WebSocket):
                         inst_type=inst_type_ws,
                         on_subscribed=_on_subscribed,
                         on_error=_on_error,
-                        unsub_args=unsub_args,
                     )
                 )
 
@@ -2153,7 +2106,6 @@ async def stream(ws: WebSocket):
                             stop_event=stop,
                             on_subscribed=_on_subscribed,
                             on_error=_on_error,
-                            unsub_args=[{"channel": "books", "instId": code}],
                         )
                     )
 
@@ -2294,7 +2246,6 @@ async def stream(ws: WebSocket):
                     await safe_send_json({"data": payload, "guid": _guid})
 
                 if symbol:
-                    unsub_args = [{"channel": "tickers", "instId": symbol}]
                     # Сначала запускается подписка и ждём подтверждение/ошибку от OKX
                     subscribed_evt = asyncio.Event()
                     error_evt = asyncio.Event()
@@ -2326,7 +2277,6 @@ async def stream(ws: WebSocket):
                             stop_event=stop,
                             on_subscribed=_on_subscribed,
                             on_error=_on_error,
-                            unsub_args=unsub_args,
                         )
                     )
 
@@ -2424,8 +2374,6 @@ async def stream(ws: WebSocket):
                 inst_type_msg = msg.get("instrumentGroup") or msg.get("board")
                 inst_type_ws = str(inst_type_msg).strip().upper() if inst_type_msg else ""
                 inst_type_rest = str(inst_type_msg).strip().upper() if inst_type_msg else None
-                inst_types_ws = [inst_type_ws] if inst_type_ws in ("SPOT", "SWAP", "FUTURES") else ["SPOT", "SWAP", "FUTURES"]
-                unsub_args = [{"channel": "orders", "instType": it} for it in inst_types_ws]
 
                 asyncio.create_task(
                     adapter.subscribe_trades(
@@ -2434,7 +2382,6 @@ async def stream(ws: WebSocket):
                         inst_type=inst_type_ws,
                         on_subscribed=_on_subscribed,
                         on_error=_on_error,
-                        unsub_args=unsub_args,
                     )
                 )
 
@@ -2553,11 +2500,6 @@ async def stream(ws: WebSocket):
                 def _on_subscribed(_ev: dict):
                     subscribed_evt.set()
 
-                unsub_args = [{"channel": "account"}]
-                inst_type_u = (inst_type_s or "SPOT").strip().upper()
-                if inst_type_u in ("FUTURES", "SWAP"):
-                    unsub_args.append({"channel": "positions", "instType": inst_type_u})
-
                 asyncio.create_task(
                     adapter.subscribe_positions(
                         on_data=lambda p, _g=sub_guid: asyncio.create_task(_on_live_pos(p, _g)),
@@ -2565,7 +2507,6 @@ async def stream(ws: WebSocket):
                         inst_type=inst_type_s,
                         on_error=_on_error,
                         on_subscribed=_on_subscribed,
-                        unsub_args=unsub_args,
                     )
                 )
                 if not await wait_okx_subscribed_or_error(subscribed_evt, error_evt, sub_guid, stop):
@@ -2658,7 +2599,6 @@ async def stream(ws: WebSocket):
                         stop_event=stop,
                         on_subscribed=_on_subscribed,
                         on_error=_on_error,
-                        unsub_args=[{"channel": "account"}],
                     )
                 )
 
@@ -2683,58 +2623,6 @@ async def stream(ws: WebSocket):
                         await send_summary_astras(s, sub_guid)
                     live_buffer.clear()
 
-                continue
-
-            # создание рыночной заявки (Astras WS: create:market)
-            if opcode == "create:market": #timeInForce не поддерживается
-                order_guid = msg.get("guid") or req_guid
-                if not order_guid:
-                    await send_error_and_close(None, 400, "guid is required")
-                    raise WebSocketDisconnect
-
-                check_duplicates = msg.get("checkDuplicates", True)
-                if bool(check_duplicates) and order_guid in ws_market_idempotency:
-                    await safe_send_json(ws_market_idempotency[order_guid])
-                    continue
-
-                side = (msg.get("side") or "").lower()
-                qty = msg.get("quantity")
-                instr = msg.get("instrument") or {}
-                symbol = instr.get("symbol")
-                inst_type = instr.get("instrumentGroup") or instr.get("board")
-                allow_margin = bool(msg.get("allowMargin", False))
-                inst_type_s = str(inst_type).strip().upper() if inst_type is not None else ""
-                tgt_ccy = "base_ccy" if (inst_type_s == "SPOT" and side == "buy") else None
-                if inst_type_s in ("FUTURES", "SWAP"):
-                    td_mode = "cross"
-                elif inst_type_s == "SPOT":
-                    td_mode = "cross" if allow_margin else "cash"
-
-                try:
-                    res = await adapter.place_market_order_ws(
-                        symbol=symbol,
-                        side=side,
-                        quantity=qty,
-                        inst_type=inst_type_s,
-                        tgt_ccy=tgt_ccy,
-                        td_mode=td_mode,
-                        cl_ord_id=order_guid,
-                    )
-                except Exception as e:
-                    await send_error_and_close(order_guid, 502, str(e))
-                    raise WebSocketDisconnect
-
-                ord_id = str(res.get("ordId") or "0")
-                out = {
-                    "requestGuid": order_guid,
-                    "httpCode": 200,
-                    "message": f"An order '{ord_id}' has been created.",
-                    "orderNumber": ord_id,
-                }
-                if bool(check_duplicates):
-                    ws_market_idempotency[order_guid] = out
-
-                await safe_send_json(out)
                 continue
 
     except WebSocketDisconnect:
