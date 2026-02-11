@@ -2250,42 +2250,29 @@ async def ws_stream(ws: WebSocket):
                         "symbol": symbol,
                         "exchange": exchange_out,
                         "description": None,
-
                         "prev_close_price": open_price,
-
                         "last_price": last_price,
                         "last_price_timestamp": ts_sec,
-
                         # high/low: 24h high/low от OKX
                         "high_price": high_price,
                         "low_price": low_price,
-
                         "accruedInt": 0,
                         "volume": volume,
-
                         "open_interest": None,
-
                         "ask": ask,
                         "bid": bid,
-
                         "ask_vol": ask_sz,
                         "bid_vol": bid_sz,
-
                         "ob_ms_timestamp": None,
-
                         "open_price": open_price,  # цена 24 часа назад (OKX open24h)
                         "yield": None,
-
                         "lotsize": 0,
                         "lotvalue": 0,
                         "facevalue": 0,
                         "type": "0",
-
                         "total_bid_vol": 0,
                         "total_ask_vol": 0,
-
                         "accrued_interest": 0,
-
                         # change/change_percent зависят от prev_close_price; при null -> 0
                         "change": change,
                         "change_percent": change_percent,
