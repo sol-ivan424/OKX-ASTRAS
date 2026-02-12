@@ -2434,6 +2434,7 @@ class OkxAdapter:
                 {
                     "ccy": ccy,
                     "availEq": self._to_float(d.get("availEq")),
+                    "imr": self._to_float(d.get("imr")),
                 }
             )
         return {

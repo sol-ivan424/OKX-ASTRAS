@@ -82,14 +82,17 @@ async def md_client_summary(exchange: str, portfolio: str):
 
     by_ccy = (snap or {}).get("byCcy") or []
     buying_power_by_ccy = []
+    details_imr_sum = 0.0
     for x in by_ccy:
         ccy = x.get("ccy")
         if not ccy:
             continue
+        details_imr_sum += float(x.get("imr", 0) or 0)
         buying_power_by_ccy.append({
             "currency": str(ccy),
             "buyingPower": float(x.get("availEq", 0) or 0),
         })
+    initial_margin = imr if imr != 0 else details_imr_sum
 
     payload = {
         "buyingPowerAtMorning": 0,
@@ -97,9 +100,9 @@ async def md_client_summary(exchange: str, portfolio: str):
         "profit": 0,
         "profitRate": 0,
         "portfolioEvaluation": total_eq,
-        "portfolioLiquidationValue": total_eq,
-        "initialMargin": imr,
-        "correctedMargin": imr,
+        "portfolioLiquidationValue": 0,
+        "initialMargin": initial_margin,
+        "correctedMargin": 0,
         "riskBeforeForcePositionClosing": 0,
         "commission": 0,
         "buyingPowerByCurrency": buying_power_by_ccy,
@@ -118,7 +121,7 @@ async def md_client_positions(
 ):
     #Используем тот же snapshot, что и в WS PositionsGetAndSubscribeV2.
     #exchange_out = exchange or "OKX"
-    exchange_out = exchange or "UNITED"
+    exchange_out = exchange or "OKX"
     portfolio_out = portfolio or client_id
     result: list[dict] = []
     try:
@@ -136,13 +139,9 @@ async def md_client_positions(
             avg_price = float(p.get("avgPrice", 0) or 0)
             cur_price = p.get("currentPrice")
             cur_price = float(cur_price) if cur_price is not None else None
-            # volume считаем ТОЛЬКО если можем
+            # По текущей схеме для positions всегда отдаём 0
             volume = 0.00
-            if avg_price and qty_units:
-                volume = avg_price * qty_units
             current_volume = 0
-            if cur_price is not None and qty_units:
-                current_volume = cur_price * qty_units
             result.append({
                 "volume": volume,
                 "currentVolume": current_volume,
@@ -155,10 +154,10 @@ async def md_client_positions(
                 "openUnits": 0.00,
                 "lotSize": float(p.get("lotSize", 0) or 0),
                 "shortName": p.get("shortName") or symbol,
-                "qtyT0": 0,
-                "qtyT1": 0,
-                "qtyT2": 0,
-                "qtyTFuture": 0,
+                "qtyT0": qty_units,
+                "qtyT1": qty_units,
+                "qtyT2": qty_units,
+                "qtyTFuture": qty_units,
                 "qtyT0Batch": 0,
                 "qtyT1Batch": 0,
                 "qtyT2Batch": 0,
@@ -2454,7 +2453,7 @@ async def ws_stream(ws: WebSocket):
                 stop = asyncio.Event()
                 active["positions"].append(stop)
                 #exchange_out = "OKX"
-                exchange_out = "UNITED"
+                exchange_out = "OKX"
                 portfolio = msg.get("portfolio")
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
@@ -2473,19 +2472,8 @@ async def ws_stream(ws: WebSocket):
                     avg_price_raw = p.get("avgPrice")
                     qty_units = float(qty_units_raw) if qty_units_raw is not None else 0.00
                     avg_price = float(avg_price_raw) if avg_price_raw is not None else 0
-                    # volume/currentVolume: если OKX не дал — НЕ подставляем 0.0
-                    # volume можем посчитать как avgPrice * qtyUnits, только если оба реально пришли
-                    vol_raw = p.get("volume")
-                    cur_vol_raw = p.get("currentVolume")
-
-                    if vol_raw is not None:
-                        volume = float(vol_raw)
-                    elif qty_units_raw is not None and avg_price_raw is not None:
-                        volume = float(avg_price_raw) * float(qty_units_raw)
-                    else:
-                        volume = 0.00
-
-                    current_volume = float(cur_vol_raw) if cur_vol_raw is not None else 0
+                    volume = 0.00 # По текущей схеме для positions всегда отдаём 0
+                    current_volume = 0
 
                     payload = {
                         "volume": volume,
@@ -2499,10 +2487,10 @@ async def ws_stream(ws: WebSocket):
                         "openUnits": 0,
                         "lotSize": float(p.get("lotSize", 0) or 0),
                         "shortName": p.get("shortName") or symbol,
-                        "qtyT0": 0,
-                        "qtyT1": 0,
-                        "qtyT2": 0,
-                        "qtyTFuture": 0,
+                        "qtyT0": qty_units,
+                        "qtyT1": qty_units,
+                        "qtyT2": qty_units,
+                        "qtyTFuture": qty_units,
                         "qtyT0Batch": 0,
                         "qtyT1Batch": 0,
                         "qtyT2Batch": 0,
@@ -2597,23 +2585,26 @@ async def ws_stream(ws: WebSocket):
                     imr = float(s.get("imr", 0) or 0)
                     by_ccy = s.get("byCcy") or []
                     buying_power_by_ccy = []
+                    details_imr_sum = 0.0
                     for x in by_ccy:
                         ccy = x.get("ccy")
                         if not ccy:
                             continue
+                        details_imr_sum += float(x.get("imr", 0) or 0)
                         buying_power_by_ccy.append({
                             "currency": str(ccy),
                             "buyingPower": float(x.get("availEq", 0) or 0),
                         })
+                    initial_margin = imr if imr != 0 else details_imr_sum
                     payload = {
                         "buyingPowerAtMorning": 0,
                         "buyingPower": avail_eq,
                         "profit": 0,
                         "profitRate": 0,
                         "portfolioEvaluation": total_eq,
-                        "portfolioLiquidationValue": total_eq,
-                        "initialMargin": imr,
-                        "correctedMargin": imr,
+                        "portfolioLiquidationValue": 0,
+                        "initialMargin": initial_margin,
+                        "correctedMargin": 0,
                         "riskBeforeForcePositionClosing": 0,
                         "commission": 0,
                         "buyingPowerByCurrency": buying_power_by_ccy,
