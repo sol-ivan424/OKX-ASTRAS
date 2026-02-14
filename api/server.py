@@ -1,5 +1,7 @@
 import os
 import time
+import uuid
+import hashlib
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Header
 from typing import List, Optional
 import asyncio
@@ -31,9 +33,20 @@ def _make_adapter():
             api_key=os.getenv("OKX_API_KEY"),
             api_secret=os.getenv("OKX_API_SECRET"),
             api_passphrase=os.getenv("OKX_API_PASSPHRASE"),
+            demo=os.getenv("OKX_DEMO", "0") in ("1", "true", "True", "yes", "YES"),
         )
 
     raise RuntimeError("Поддерживается только ADAPTER=okx")
+
+
+def _okx_client_id(guid: str | None) -> str:
+    raw = str(guid or "").strip()
+    if not raw:
+        return uuid.uuid4().hex[:32]
+    try:
+        return uuid.UUID(raw).hex[:32]
+    except Exception:
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 app = FastAPI(title="Astras Crypto Gateway")
 adapter = _make_adapter()
@@ -924,45 +937,28 @@ def _astras_order_simple_from_okx_neutral(
         "brokerSymbol": broker_symbol,
         "portfolio": "DEV_portfolio",
         "exchange": exchange,
-
-        # comment по схеме string/null, у OKX нет комментария -> null
         "comment": None,
-
         "type": order_type,
         "side": o.get("side", "0"),
         "status": order_status,
 
         "transTime": trans_time,
         "updateTime": update_time,
-
-        # endTime по схеме date-time/null, у OKX здесь нет -> null
         "endTime": None,
-
-        # OKX не оперирует "штуками/лотами" как MOEX -> оставляем 0
         "qtyUnits": 0,
         "qtyBatch": 0,
-
         # qty у OKX может быть дробным, отдаём как есть
         "qty": qty,
-
-        # OKX не оперирует "штуками/лотами" как MOEX -> оставляем 0
         "filledQtyUnits": 0,
         "filledQtyBatch": 0,
-
-        # filled у OKX может быть дробным, отдаём как есть
         "filled": filled,
-
         "price": price,
-
         # existing: True — данные из снепшота/истории, False — новые события
         "existing": bool(existing),
-
         # timeInForce по схеме строка/null, берём из OKX tif и нормализуем под Astras
         "timeInForce": time_in_force,
-
         # iceberg по схеме object/null, не реализовано -> null
         "iceberg": None,
-
         "volume": volume,
     }
 
@@ -1052,6 +1048,31 @@ async def _get_instr(symbol: str) -> Optional[dict]:
     if not _INSTR_CACHE:
         await _refresh_instr_cache()
     return _INSTR_CACHE.get(symbol)
+
+async def _resolve_order_ccy(
+    symbol: Optional[str],
+    inst_type_s: str,
+    side: str,
+    allow_margin: bool,
+) -> Optional[str]:
+    if not isinstance(symbol, str) or not symbol.strip():
+        return None
+
+    side_s = str(side or "").lower()
+    if inst_type_s == "SPOT":
+        if not allow_margin:
+            return None
+        parts = [p.strip().upper() for p in symbol.split("-")]
+        if len(parts) < 2:
+            return None
+        return parts[1] if side_s == "buy" else (parts[0] if side_s == "sell" else None)
+
+    if inst_type_s in ("FUTURES", "SWAP"):
+        instr = await _get_instr(symbol)
+        ccy = (instr or {}).get("quoteCcy")
+        if ccy is not None and str(ccy).strip():
+            return str(ccy).strip().upper()
+    return None
 
 async def _astras_instruments() -> list[dict]:
     # Единый источник инструментов (как и /v2/instruments)
@@ -1654,7 +1675,7 @@ async def ws_stream(ws: WebSocket):
             )
         finally:
             await ws.close()
-        
+
     # OKX -> Astras: передаём код ошибки OKX как есть.
     def _okx_code_as_int(code):
         try:
@@ -2740,24 +2761,13 @@ async def cws_stream(ws: WebSocket):
                 })
                 continue
 
-            if opcode and (not isinstance(token, str) or not token.strip()):
-                await safe_send_json(
-                    {
-                        "data": {
-                            "error": "TokenRequired",
-                            "message": "Field 'token' is required for opcode requests",
-                        },
-                        "guid": req_guid or msg.get("guid"),
-                    }
-                )
-                continue
-
             # создание рыночной заявки (Astras CWS: create:market)
             if opcode == "create:market":  # timeInForce не поддерживается
                 order_guid = msg.get("guid") or req_guid
                 if not order_guid:
                     await send_error_and_close(None, 400, "guid is required")
                     raise WebSocketDisconnect
+                okx_client_id = _okx_client_id(order_guid)
 
                 check_duplicates = msg.get("checkDuplicates", True)
                 if bool(check_duplicates) and order_guid in _CWS_MARKET_IDEMPOTENCY:
@@ -2768,10 +2778,17 @@ async def cws_stream(ws: WebSocket):
                 qty = msg.get("quantity")
                 instr = msg.get("instrument") or {}
                 symbol = instr.get("symbol")
-                inst_type = instr.get("instrumentGroup") or instr.get("board")
+                inst_type = (
+                    instr.get("instrumentGroup")
+                    or instr.get("board")
+                    or msg.get("instrumentGroup")
+                    or msg.get("board")
+                )
                 allow_margin = bool(msg.get("allowMargin", False))
+                #allow_margin = False
                 inst_type_s = str(inst_type).strip().upper() if inst_type is not None else ""
                 tgt_ccy = "base_ccy" if (inst_type_s == "SPOT" and side == "buy") else None
+                ccy = await _resolve_order_ccy(symbol, inst_type_s, side, allow_margin)
                 if inst_type_s in ("FUTURES", "SWAP"):
                     td_mode = "cross"
                 elif inst_type_s == "SPOT":
@@ -2784,11 +2801,16 @@ async def cws_stream(ws: WebSocket):
                         quantity=qty,
                         inst_type=inst_type_s,
                         tgt_ccy=tgt_ccy,
+                        ccy=ccy,
                         td_mode=td_mode,
-                        cl_ord_id=order_guid,
+                        cl_ord_id=okx_client_id,
+                        ws_request_id=okx_client_id,
                     )
                 except Exception as e:
-                    await send_error_and_close(order_guid, 502, str(e))
+                    err_text = str(e).strip()
+                    if not err_text:
+                        err_text = type(e).__name__
+                    await send_error_and_close(order_guid, 502, err_text)
                     raise WebSocketDisconnect
 
                 ord_id = str(res.get("ordId") or "0")
@@ -2810,6 +2832,7 @@ async def cws_stream(ws: WebSocket):
                 if not order_guid:
                     await send_error_and_close(None, 400, "guid is required")
                     raise WebSocketDisconnect
+                okx_client_id = _okx_client_id(order_guid)
 
                 check_duplicates = msg.get("checkDuplicates", True)
                 if bool(check_duplicates) and order_guid in _CWS_LIMIT_IDEMPOTENCY:
@@ -2821,9 +2844,16 @@ async def cws_stream(ws: WebSocket):
                 price = msg.get("price")
                 instr = msg.get("instrument") or {}
                 symbol = instr.get("symbol")
-                inst_type = instr.get("instrumentGroup") or instr.get("board")
+                inst_type = (
+                    instr.get("instrumentGroup")
+                    or instr.get("board")
+                    or msg.get("instrumentGroup")
+                    or msg.get("board")
+                )
                 allow_margin = bool(msg.get("allowMargin", False))
+                #allow_margin = False
                 inst_type_s = str(inst_type).strip().upper() if inst_type is not None else ""
+                ccy = await _resolve_order_ccy(symbol, inst_type_s, side, allow_margin)
 
                 tif = str(msg.get("timeInForce") or "OneDay").lower()
                 if tif in ("oneday", "goodtillcancelled"):
@@ -2857,10 +2887,15 @@ async def cws_stream(ws: WebSocket):
                         inst_type=inst_type_s,
                         ord_type=okx_ord_type,
                         td_mode=td_mode,
-                        cl_ord_id=order_guid,
+                        ccy=ccy,
+                        cl_ord_id=okx_client_id,
+                        ws_request_id=okx_client_id,
                     )
                 except Exception as e:
-                    await send_error_and_close(order_guid, 502, str(e))
+                    err_text = str(e).strip()
+                    if not err_text:
+                        err_text = type(e).__name__
+                    await send_error_and_close(order_guid, 502, err_text)
                     raise WebSocketDisconnect
 
                 ord_id = str(res.get("ordId") or "0")

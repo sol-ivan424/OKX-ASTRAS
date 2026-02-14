@@ -291,6 +291,35 @@ class OkxAdapter:
             )
         return out
 
+    async def _resolve_inst_id_code(self, symbol: str, inst_type: str) -> Optional[str]:
+        """
+        Для WS order/amend/cancel OKX может требовать instIdCode.
+        Возвращает instIdCode для пары instType + instId.
+        """
+        sym = str(symbol or "").strip()
+        if not sym:
+            return None
+
+        inst_type_u = str(inst_type or "SPOT").upper().strip() or "SPOT"
+        raw = await self._request_public(
+            path="/public/instruments",
+            params={"instType": inst_type_u, "instId": sym},
+        )
+        items = raw.get("data") or []
+        if not items:
+            return None
+
+        for it in items:
+            if str((it or {}).get("instId") or "") == sym:
+                v = (it or {}).get("instIdCode")
+                if v is not None and str(v).strip() != "":
+                    return str(v)
+
+        v0 = (items[0] or {}).get("instIdCode")
+        if v0 is not None and str(v0).strip() != "":
+            return str(v0)
+        return None
+
     #маппинг таймфрейма Astras (секунды) -> OKX bar
     def _tf_to_okx_bar(self, tf: str) -> str:
         tf = str(tf).strip()
@@ -1032,6 +1061,12 @@ class OkxAdapter:
             "ordType": "market",
             "sz": _fmt_sz(quantity),
         }
+        inst_id_code = await self._resolve_inst_id_code(inst_id, inst_type)
+        if not inst_id_code:
+            raise RuntimeError(
+                f"Cannot resolve instIdCode for instType={str(inst_type or '').upper()} instId={inst_id}"
+            )
+        body["instIdCode"] = inst_id_code
         if cl_ord_id:
             body["clOrdId"] = str(cl_ord_id)
         if pos_side:
@@ -1106,6 +1141,12 @@ class OkxAdapter:
             "ordType": "market",
             "sz": _fmt_sz(quantity),
         }
+        inst_id_code = await self._resolve_inst_id_code(inst_id, inst_type)
+        if not inst_id_code:
+            raise RuntimeError(
+                f"Cannot resolve instIdCode for instType={str(inst_type or '').upper()} instId={inst_id}"
+            )
+        body["instIdCode"] = inst_id_code
         if cl_ord_id:
             body["clOrdId"] = str(cl_ord_id)
         if pos_side:
@@ -1157,7 +1198,16 @@ class OkxAdapter:
 
                 code = str(msg.get("code") or "")
                 if code and code != "0":
-                    raise RuntimeError(f"OKX WS order error {code}: {msg.get('msg')}")
+                    err_msg = str(msg.get("msg") or "").strip()
+                    err_items = msg.get("data") or []
+                    err_it0 = err_items[0] if err_items else {}
+                    err_s_code = str((err_it0 or {}).get("sCode") or "")
+                    err_s_msg = str((err_it0 or {}).get("sMsg") or "")
+                    if err_s_code or err_s_msg:
+                        raise RuntimeError(
+                            f"OKX WS order error {code}: {err_msg} (sCode={err_s_code or 'n/a'}, sMsg={err_s_msg})"
+                        )
+                    raise RuntimeError(f"OKX WS order error {code}: {err_msg}")
 
                 items = msg.get("data") or []
                 if not items:
@@ -1223,6 +1273,12 @@ class OkxAdapter:
             "sz": _fmt_num(quantity),
             "px": _fmt_num(price),
         }
+        inst_id_code = await self._resolve_inst_id_code(inst_id, inst_type)
+        if not inst_id_code:
+            raise RuntimeError(
+                f"Cannot resolve instIdCode for instType={str(inst_type or '').upper()} instId={inst_id}"
+            )
+        body["instIdCode"] = inst_id_code
         if cl_ord_id:
             body["clOrdId"] = str(cl_ord_id)
         if pos_side:
@@ -1272,7 +1328,16 @@ class OkxAdapter:
 
                 code = str(msg.get("code") or "")
                 if code and code != "0":
-                    raise RuntimeError(f"OKX WS order error {code}: {msg.get('msg')}")
+                    err_msg = str(msg.get("msg") or "").strip()
+                    err_items = msg.get("data") or []
+                    err_it0 = err_items[0] if err_items else {}
+                    err_s_code = str((err_it0 or {}).get("sCode") or "")
+                    err_s_msg = str((err_it0 or {}).get("sMsg") or "")
+                    if err_s_code or err_s_msg:
+                        raise RuntimeError(
+                            f"OKX WS order error {code}: {err_msg} (sCode={err_s_code or 'n/a'}, sMsg={err_s_msg})"
+                        )
+                    raise RuntimeError(f"OKX WS order error {code}: {err_msg}")
 
                 items = msg.get("data") or []
                 if not items:
