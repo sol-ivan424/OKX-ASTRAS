@@ -5,6 +5,7 @@ import hmac
 import base64
 import hashlib
 import asyncio
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Callable
@@ -61,6 +62,10 @@ class OkxAdapter:
         self._demo = demo
 
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._inst_id_code_cache: Dict[str, str] = {}
+        self._inst_id_code_cache_ts: float = 0.0
+        self._inst_id_code_cache_ttl_sec: float = 60.0
+        self._inst_id_code_cache_lock = asyncio.Lock()
 
         # WS для свечей у OKX идёт через /ws/v5/business (а не /public)
         # Иначе OKX отвечает 60018: Wrong URL or channel:candle..., instId ... doesn't exist
@@ -293,32 +298,57 @@ class OkxAdapter:
 
     async def _resolve_inst_id_code(self, symbol: str, inst_type: str) -> Optional[str]:
         """
-        Для WS order/amend/cancel OKX может требовать instIdCode.
-        Возвращает instIdCode для пары instType + instId.
+        Возвращает instIdCode из отдельного кэша.
+        Кэш обновляется пакетно 3 запросами:
+        - instType=SPOT
+        - instType=FUTURES
+        - instType=SWAP
         """
         sym = str(symbol or "").strip()
         if not sym:
             return None
 
         inst_type_u = str(inst_type or "SPOT").upper().strip() or "SPOT"
-        raw = await self._request_public(
-            path="/public/instruments",
-            params={"instType": inst_type_u, "instId": sym},
-        )
-        items = raw.get("data") or []
-        if not items:
-            return None
+        await self._ensure_inst_id_code_cache()
 
-        for it in items:
-            if str((it or {}).get("instId") or "") == sym:
-                v = (it or {}).get("instIdCode")
-                if v is not None and str(v).strip() != "":
-                    return str(v)
+        key = f"{inst_type_u}:{sym}"
+        v = self._inst_id_code_cache.get(key)
+        if v:
+            return v
 
-        v0 = (items[0] or {}).get("instIdCode")
-        if v0 is not None and str(v0).strip() != "":
-            return str(v0)
-        return None
+        # Инструмент мог появиться после последнего refresh — пробуем один раз обновить кэш.
+        await self._refresh_inst_id_code_cache()
+        return self._inst_id_code_cache.get(key)
+
+    async def _refresh_inst_id_code_cache(self) -> None:
+        new_cache: Dict[str, str] = {}
+        for one_type in ("SPOT", "FUTURES", "SWAP"):
+            raw = await self._request_public(
+                path="/public/instruments",
+                params={"instType": one_type},
+            )
+            for it in raw.get("data") or []:
+                inst_id = str((it or {}).get("instId") or "").strip()
+                inst_id_code = (it or {}).get("instIdCode")
+                if not inst_id:
+                    continue
+                if inst_id_code is None or str(inst_id_code).strip() == "":
+                    continue
+                new_cache[f"{one_type}:{inst_id}"] = str(inst_id_code)
+
+        self._inst_id_code_cache = new_cache
+        self._inst_id_code_cache_ts = time.time()
+
+    async def _ensure_inst_id_code_cache(self) -> None:
+        now = time.time()
+        if self._inst_id_code_cache and (now - self._inst_id_code_cache_ts) < self._inst_id_code_cache_ttl_sec:
+            return
+
+        async with self._inst_id_code_cache_lock:
+            now = time.time()
+            if self._inst_id_code_cache and (now - self._inst_id_code_cache_ts) < self._inst_id_code_cache_ttl_sec:
+                return
+            await self._refresh_inst_id_code_cache()
 
     #маппинг таймфрейма Astras (секунды) -> OKX bar
     def _tf_to_okx_bar(self, tf: str) -> str:
