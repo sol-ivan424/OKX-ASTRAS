@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import hashlib
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Header
 from typing import List, Optional
 import asyncio
@@ -922,14 +923,7 @@ def _astras_order_simple_from_okx_neutral(
     trans_time = _iso_from_unix_ms(int(o.get("ts_create", 0) or 0))
     update_time = _iso_from_unix_ms(int(o.get("ts_update", 0) or 0))
 
-    # volume: для market по схеме должен быть null, для limit можно посчитать price * qty
-    if order_type == "market":
-        volume = None
-    else:
-        try:
-            volume = float(price) * float(qty)
-        except Exception:
-            volume = 0
+    volume = 0
 
     return {
         "id": o.get("id", "0"),
@@ -1486,6 +1480,128 @@ async def cmd_limit_order(
     _ORDER_IDEMPOTENCY_LIMIT[x_reqid] = out
     return JSONResponse(out)
 
+@app.post("/commandapi/warptrans/FX1/v2/client/orders/estimate") 
+@app.post("/commandapi/warptrans/TRADE/v2/client/orders/estimate")
+async def cmd_orders_estimate(request: Request): # includeLimitOrders не учитывается
+    body = await request.json()
+
+    portfolio = str(body.get("portfolio") or "").strip()
+    ticker = str(body.get("ticker") or "").strip()
+    exchange = str(body.get("exchange") or "OKX").strip()
+    board = str(body.get("board") or "").strip().upper()
+
+    if not portfolio:
+        raise HTTPException(status_code=400, detail="portfolio is required")
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    instr = await _get_instr(ticker)
+    inst_type_s = board if board in SUPPORTED_BOARDS else str((instr or {}).get("instType") or "").strip().upper()
+    if inst_type_s not in SUPPORTED_BOARDS:
+        raise HTTPException(status_code=400, detail="Unsupported board/instrumentGroup")
+
+    price_raw = body.get("price")
+    lot_qty_raw = body.get("lotQuantity")
+    price_f: float | None = None
+    lot_qty_f: float | None = None
+    if price_raw is not None and str(price_raw).strip() != "":
+        try:
+            price_f = float(price_raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="price must be number")
+    if lot_qty_raw is not None and str(lot_qty_raw).strip() != "":
+        try:
+            lot_qty_f = float(lot_qty_raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="lotQuantity must be number")
+
+    lot_step = str((instr or {}).get("lotSz") or "0")
+
+    def _round_to_step(v: float, step: str) -> float:
+        try:
+            dv = Decimal(str(v))
+            ds = Decimal(str(step))
+        except (InvalidOperation, ValueError, TypeError):
+            return float(v)
+        if ds <= 0:
+            return float(str(dv))
+        q = (dv / ds).to_integral_value(rounding=ROUND_DOWN) * ds
+        scale = max(0, -ds.as_tuple().exponent)
+        return float(f"{q:.{scale}f}")
+
+    quantity_to_buy = 0.0
+    quantity_to_sell = 0.0
+    not_margin_quantity_to_buy = 0.0
+    not_margin_quantity_to_sell = 0.0
+
+    px_arg = None if price_f is None else str(price_f)
+
+    async def _safe_max_size(td_mode: str, ccy: str | None = None) -> dict:
+        try:
+            return await adapter.get_max_order_size(
+                inst_id=ticker,
+                td_mode=td_mode,
+                ccy=ccy,
+                px=px_arg,
+            )
+        except Exception:
+            return {}
+
+    if inst_type_s == "SPOT":
+        parts = [p.strip().upper() for p in ticker.split("-")]
+        base_ccy = parts[0] if len(parts) >= 1 else None
+        quote_ccy = parts[1] if len(parts) >= 2 else None
+
+        # с плечом
+        if quote_ccy:
+            cross_buy = await _safe_max_size("cross", quote_ccy)
+            quantity_to_buy = float(cross_buy.get("maxBuy", 0) or 0)
+        if base_ccy:
+            cross_sell = await _safe_max_size("cross", base_ccy)
+            quantity_to_sell = float(cross_sell.get("maxSell", 0) or 0)
+
+        # без плеча
+        cash_sz = await _safe_max_size("cash")
+        not_margin_quantity_to_buy = float(cash_sz.get("maxBuy", 0) or 0)
+        if base_ccy:
+            try:
+                balances = await adapter.get_account_balances()
+                not_margin_quantity_to_sell = sum(
+                    float(x.get("availBal", 0) or 0)
+                    for x in (balances or [])
+                    if str(x.get("ccy") or "").upper() == base_ccy
+                )
+            except Exception:
+                pass
+    else:
+        der_sz = await _safe_max_size("cross")
+        quantity_to_buy = float(der_sz.get("maxBuy", 0) or 0)
+        quantity_to_sell = float(der_sz.get("maxSell", 0) or 0)
+
+    quantity_to_buy = _round_to_step(quantity_to_buy, lot_step)
+    quantity_to_sell = _round_to_step(quantity_to_sell, lot_step)
+    not_margin_quantity_to_buy = _round_to_step(not_margin_quantity_to_buy, lot_step)
+    not_margin_quantity_to_sell = _round_to_step(not_margin_quantity_to_sell, lot_step)
+
+    order_evaluation = (price_f * lot_qty_f) if (price_f is not None and lot_qty_f is not None) else 0.0
+    commission = 0.0
+    buy_price = price_f if price_f is not None else None
+
+    out = {
+        "portfolio": portfolio,
+        "ticker": ticker,
+        "exchange": exchange,
+        "board": board or inst_type_s,
+        "quantityToSell": quantity_to_sell,
+        "quantityToBuy": quantity_to_buy,
+        "notMarginQuantityToSell": not_margin_quantity_to_sell,
+        "notMarginQuantityToBuy": not_margin_quantity_to_buy,
+        "orderEvaluation": order_evaluation,
+        "commission": commission,
+        "buyPrice": buy_price,
+        "isUnitedPortfolio": False,
+    }
+    return JSONResponse(out)
+
 @app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/stop")
 async def create_stop_order(request: Request):
 
@@ -1985,7 +2101,12 @@ async def ws_stream(ws: WebSocket):
                 inst_type_msg = msg.get("instrumentGroup") or msg.get("board")
                 inst_type_ws = str(inst_type_msg).strip().upper() if inst_type_msg else ""
                 inst_type_rest = str(inst_type_msg).strip().upper() if inst_type_msg else None
-                inst_types_ws = [inst_type_ws] if inst_type_ws in ("SPOT", "SWAP", "FUTURES") else ["SPOT", "SWAP", "FUTURES"]
+                if inst_type_ws == "SPOT":
+                    inst_types_ws = ["SPOT", "MARGIN"]
+                elif inst_type_ws in ("SWAP", "FUTURES", "MARGIN"):
+                    inst_types_ws = [inst_type_ws]
+                else:
+                    inst_types_ws = ["SPOT", "SWAP", "FUTURES", "MARGIN"]
                 unsub_args = [{"channel": "orders", "instType": it} for it in inst_types_ws]
 
                 asyncio.create_task(
@@ -2021,7 +2142,12 @@ async def ws_stream(ws: WebSocket):
                 # REST history: orders-history (SPOT + FUTURES + SWAP)
                 if not skip_history and hasattr(adapter, "get_orders_history"):
                     try:
-                        inst_types = ["SPOT", "FUTURES", "SWAP"] if not inst_type_rest else [inst_type_rest]
+                        if not inst_type_rest:
+                            inst_types = ["SPOT", "FUTURES", "SWAP", "MARGIN"]
+                        elif inst_type_rest == "SPOT":
+                            inst_types = ["SPOT", "MARGIN"]
+                        else:
+                            inst_types = [inst_type_rest]
                         for it in inst_types:
                             history = await adapter.get_orders_history(
                                 inst_type=it,
@@ -2035,7 +2161,12 @@ async def ws_stream(ws: WebSocket):
                 # история заявок (pending) через REST
                 if (not skip_history) and hasattr(adapter, "get_orders_pending"):
                     try:
-                        inst_types = ["SPOT", "FUTURES", "SWAP"] if not inst_type_rest else [inst_type_rest]
+                        if not inst_type_rest:
+                            inst_types = ["SPOT", "FUTURES", "SWAP", "MARGIN"]
+                        elif inst_type_rest == "SPOT":
+                            inst_types = ["SPOT", "MARGIN"]
+                        else:
+                            inst_types = [inst_type_rest]
                         for it in inst_types:
                             history_orders = await adapter.get_orders_pending(
                                 inst_type=it,

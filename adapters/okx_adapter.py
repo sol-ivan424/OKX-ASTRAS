@@ -841,6 +841,8 @@ class OkxAdapter:
         state = d.get("state") or "0"
 
         px = self._to_float(d.get("px"))
+        if px == 0:
+            px = self._to_float(d.get("avgPx"))
         sz = self._to_float(d.get("sz"))
         fill_sz = self._to_float(d.get("fillSz"))
 
@@ -953,10 +955,12 @@ class OkxAdapter:
         it = _norm_inst_type(inst_type)
 
         # Если inst_type не задан или не распознан — берём по всем основным типам
-        if it in ("SPOT", "SWAP", "FUTURES"):
+        if it == "SPOT":
+            inst_types = ["SPOT", "MARGIN"]
+        elif it in ("SWAP", "FUTURES", "MARGIN"):
             inst_types = [it]
         else:
-            inst_types = ["SPOT", "SWAP", "FUTURES"]
+            inst_types = ["SPOT", "SWAP", "FUTURES", "MARGIN"]
 
         out: List[Dict[str, Any]] = []
 
@@ -1012,7 +1016,9 @@ class OkxAdapter:
         # Если inst_type не задан — берём по всем основным типам
         inst_types: List[str]
         if it is None:
-            inst_types = ["SPOT", "SWAP", "FUTURES"]
+            inst_types = ["SPOT", "SWAP", "FUTURES", "MARGIN"]
+        elif it == "SPOT":
+            inst_types = ["SPOT", "MARGIN"]
         else:
             inst_types = [it]
 
@@ -1583,6 +1589,36 @@ class OkxAdapter:
             "sMsg": s_msg,
         }
 
+    #REST: оценка максимально доступного размера заявки
+    async def get_max_order_size(
+        self,
+        inst_id: str,
+        td_mode: str,
+        ccy: Optional[str] = None,
+        px: Optional[Any] = None,
+    ) -> Dict[str, float]:
+        """
+        OKX REST: GET /api/v5/account/max-size
+        Возвращает maxBuy / maxSell в единицах размера заявки (sz).
+        """
+        params: Dict[str, Any] = {
+            "instId": str(inst_id),
+            "tdMode": str(td_mode),
+        }
+        if ccy is not None and str(ccy).strip():
+            params["ccy"] = str(ccy).strip()
+        if px is not None and str(px).strip():
+            params["px"] = str(px).strip()
+
+        raw = await self._request_private("GET", "/account/max-size", params=params)
+        items = raw.get("data") or []
+        it0 = items[0] if items else {}
+
+        return {
+            "maxBuy": self._to_float((it0 or {}).get("maxBuy")),
+            "maxSell": self._to_float((it0 or {}).get("maxSell")),
+        }
+
     #REST: история сделок (fills-history) — исполнения за последние 3 месяца
     async def get_trades_history(
         self,
@@ -1643,10 +1679,12 @@ class OkxAdapter:
         login_msg = self._ws_login_payload()
 
         inst_type_u = str(inst_type).strip().upper() if inst_type else ""
-        if inst_type_u in ("SPOT", "SWAP", "FUTURES"):
+        if inst_type_u == "SPOT":
+            inst_types = ["SPOT", "MARGIN"]
+        elif inst_type_u in ("SWAP", "FUTURES", "MARGIN"):
             inst_types = [inst_type_u]
         else:
-            inst_types = ["SPOT", "SWAP", "FUTURES"]
+            inst_types = ["SPOT", "SWAP", "FUTURES", "MARGIN"]
 
         sub_args_list: List[Dict[str, Any]] = []
         for it in inst_types:
