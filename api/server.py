@@ -52,6 +52,11 @@ def _okx_client_id(guid: str | None) -> str:
 app = FastAPI(title="Astras Crypto Gateway")
 adapter = _make_adapter()
 
+@app.on_event("startup")
+async def _warmup_okx():
+    await adapter._ensure_order_ws()
+    await adapter._ensure_inst_id_code_cache()
+
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1582,7 +1587,23 @@ async def cmd_orders_estimate(request: Request): # includeLimitOrders не уч�
     not_margin_quantity_to_buy = _round_to_step(not_margin_quantity_to_buy, lot_step)
     not_margin_quantity_to_sell = _round_to_step(not_margin_quantity_to_sell, lot_step)
 
-    order_evaluation = (price_f * lot_qty_f) if (price_f is not None and lot_qty_f is not None) else 0.0
+    if price_f is not None and lot_qty_f is not None:
+        if inst_type_s == "SPOT":
+            order_evaluation = price_f * lot_qty_f
+        elif inst_type_s in ("FUTURES", "SWAP"):
+            ct_val = float((instr or {}).get("ctVal") or 0)
+            ct_val_ccy = str((instr or {}).get("ctValCcy") or "").strip().upper()
+            quote_ccy = str((instr or {}).get("quoteCcy") or "").strip().upper()
+            if ct_val > 0:
+                # linear: ctVal в base -> переводим в quote через цену
+                # inverse: ctVal в quote -> сразу стоимость в quote
+                order_evaluation = (ct_val * lot_qty_f) if (ct_val_ccy and quote_ccy and ct_val_ccy == quote_ccy) else (price_f * ct_val * lot_qty_f)
+            else:
+                order_evaluation = 0.0
+        else:
+            order_evaluation = 0.0
+    else:
+        order_evaluation = 0.0
     commission = 0.0
     buy_price = price_f if price_f is not None else None
 

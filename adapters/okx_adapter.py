@@ -66,6 +66,9 @@ class OkxAdapter:
         self._inst_id_code_cache_ts: float = 0.0
         self._inst_id_code_cache_ttl_sec: float = 60.0
         self._inst_id_code_cache_lock = asyncio.Lock()
+        self._order_ws = None
+        self._order_ws_lock = asyncio.Lock()
+        self._order_ws_req_lock = asyncio.Lock()
 
         # WS для свечей у OKX идёт через /ws/v5/business (а не /public)
         # Иначе OKX отвечает 60018: Wrong URL or channel:candle..., instId ... doesn't exist
@@ -142,6 +145,7 @@ class OkxAdapter:
         if self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
+        await self._close_order_ws()
 
     #нормализация пути к /api/v5/...
     def _normalize_path(self, path: str) -> str:
@@ -290,6 +294,8 @@ class OkxAdapter:
                     # FUTURES/SWAP: у OKX quoteCcy часто пустой, валюты берём из settleCcy/ctValCcy
                     "baseCcy": item.get("baseCcy") or item.get("ctValCcy"),
                     "quoteCcy": item.get("quoteCcy") or item.get("settleCcy"),
+                    "ctVal": to_opt_float(item.get("ctVal")),
+                    "ctValCcy": item.get("ctValCcy"),
                     "lotSz": to_opt_float(item.get("lotSz")),
                     "tickSz": to_opt_float(item.get("tickSz")),
                 }
@@ -825,6 +831,83 @@ class OkxAdapter:
         except Exception:
             return
 
+    async def _close_order_ws(self) -> None:
+        ws = self._order_ws
+        self._order_ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def _ensure_order_ws(self):
+        if self._order_ws is not None:
+            return self._order_ws
+
+        async with self._order_ws_lock:
+            if self._order_ws is not None:
+                return self._order_ws
+
+            ws = await websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20)
+            await ws.send(json.dumps(self._ws_login_payload()))
+
+            login_deadline = asyncio.get_event_loop().time() + 5.0
+            while True:
+                if asyncio.get_event_loop().time() > login_deadline:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError("OKX WS login timeout")
+
+                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                msg = json.loads(raw)
+
+                if msg.get("event") == "error":
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
+
+                if msg.get("event") == "login":
+                    if msg.get("code") == "0":
+                        self._order_ws = ws
+                        return ws
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
+
+    async def _place_order_via_private_ws(self, body: Dict[str, Any], req_id: str) -> Dict[str, Any]:
+        order_msg = {"id": req_id, "op": "order", "args": [body]}
+
+        async with self._order_ws_req_lock:
+            last_err = None
+            for _ in range(2):
+                ws = await self._ensure_order_ws()
+                try:
+                    await ws.send(json.dumps(order_msg))
+
+                    resp_deadline = asyncio.get_event_loop().time() + 5.0
+                    while True:
+                        if asyncio.get_event_loop().time() > resp_deadline:
+                            raise RuntimeError("OKX WS order timeout")
+
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        msg = json.loads(raw)
+                        if msg.get("id") != req_id:
+                            continue
+                        return msg
+                except Exception as e:
+                    last_err = e
+                    await self._close_order_ws()
+                    continue
+            if last_err is not None:
+                raise last_err
+            raise RuntimeError("OKX WS order error")
+
     #парсер ордера OKX (REST и WS) в нейтральный формат
     def _parse_okx_order_any(self, d: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1195,72 +1278,37 @@ class OkxAdapter:
             body["tif"] = str(tif)
 
         req_id = str(ws_request_id or cl_ord_id or f"order-{uuid.uuid4().hex}")
-        login_msg = self._ws_login_payload()
-        order_msg = {"id": req_id, "op": "order", "args": [body]}
+        msg = await self._place_order_via_private_ws(body, req_id)
 
-        async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
-            await ws.send(json.dumps(login_msg))
+        code = str(msg.get("code") or "")
+        if code and code != "0":
+            err_msg = str(msg.get("msg") or "").strip()
+            err_items = msg.get("data") or []
+            err_it0 = err_items[0] if err_items else {}
+            err_s_code = str((err_it0 or {}).get("sCode") or "")
+            err_s_msg = str((err_it0 or {}).get("sMsg") or "")
+            if err_s_code or err_s_msg:
+                raise RuntimeError(
+                    f"OKX WS order error {code}: {err_msg} (sCode={err_s_code or 'n/a'}, sMsg={err_s_msg})"
+                )
+            raise RuntimeError(f"OKX WS order error {code}: {err_msg}")
 
-            authed = False
-            login_deadline = asyncio.get_event_loop().time() + 5.0
-            while not authed:
-                if asyncio.get_event_loop().time() > login_deadline:
-                    raise RuntimeError("OKX WS login timeout")
+        items = msg.get("data") or []
+        if not items:
+            raise RuntimeError("OKX WS order: empty response data")
 
-                raw = await ws.recv()
-                msg = json.loads(raw)
+        it0 = items[0] or {}
+        s_code = str(it0.get("sCode") or "")
+        s_msg = str(it0.get("sMsg") or "")
+        if s_code and s_code != "0":
+            raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
 
-                if msg.get("event") == "error":
-                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
-
-                if msg.get("event") == "login":
-                    if msg.get("code") == "0":
-                        authed = True
-                        break
-                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
-
-            await ws.send(json.dumps(order_msg))
-
-            resp_deadline = asyncio.get_event_loop().time() + 5.0
-            while True:
-                if asyncio.get_event_loop().time() > resp_deadline:
-                    raise RuntimeError("OKX WS order timeout")
-
-                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                msg = json.loads(raw)
-
-                if msg.get("id") != req_id:
-                    continue
-
-                code = str(msg.get("code") or "")
-                if code and code != "0":
-                    err_msg = str(msg.get("msg") or "").strip()
-                    err_items = msg.get("data") or []
-                    err_it0 = err_items[0] if err_items else {}
-                    err_s_code = str((err_it0 or {}).get("sCode") or "")
-                    err_s_msg = str((err_it0 or {}).get("sMsg") or "")
-                    if err_s_code or err_s_msg:
-                        raise RuntimeError(
-                            f"OKX WS order error {code}: {err_msg} (sCode={err_s_code or 'n/a'}, sMsg={err_s_msg})"
-                        )
-                    raise RuntimeError(f"OKX WS order error {code}: {err_msg}")
-
-                items = msg.get("data") or []
-                if not items:
-                    raise RuntimeError("OKX WS order: empty response data")
-
-                it0 = items[0] or {}
-                s_code = str(it0.get("sCode") or "")
-                s_msg = str(it0.get("sMsg") or "")
-                if s_code and s_code != "0":
-                    raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
-
-                return {
-                    "ordId": str(it0.get("ordId") or "0"),
-                    "clOrdId": str(it0.get("clOrdId") or ""),
-                    "sCode": s_code or "0",
-                    "sMsg": s_msg,
-                }
+        return {
+            "ordId": str(it0.get("ordId") or "0"),
+            "clOrdId": str(it0.get("clOrdId") or ""),
+            "sCode": s_code or "0",
+            "sMsg": s_msg,
+        }
 
     #WS: выставление лимитной заявки (limit/ioc/fok/post_only) через private WS op=order
     async def place_limit_order_ws(
@@ -1325,72 +1373,37 @@ class OkxAdapter:
             body["tif"] = str(tif)
 
         req_id = str(ws_request_id or cl_ord_id or f"order-{uuid.uuid4().hex}")
-        login_msg = self._ws_login_payload()
-        order_msg = {"id": req_id, "op": "order", "args": [body]}
+        msg = await self._place_order_via_private_ws(body, req_id)
 
-        async with websockets.connect(self._ws_private_url, ping_interval=20, ping_timeout=20) as ws:
-            await ws.send(json.dumps(login_msg))
+        code = str(msg.get("code") or "")
+        if code and code != "0":
+            err_msg = str(msg.get("msg") or "").strip()
+            err_items = msg.get("data") or []
+            err_it0 = err_items[0] if err_items else {}
+            err_s_code = str((err_it0 or {}).get("sCode") or "")
+            err_s_msg = str((err_it0 or {}).get("sMsg") or "")
+            if err_s_code or err_s_msg:
+                raise RuntimeError(
+                    f"OKX WS order error {code}: {err_msg} (sCode={err_s_code or 'n/a'}, sMsg={err_s_msg})"
+                )
+            raise RuntimeError(f"OKX WS order error {code}: {err_msg}")
 
-            authed = False
-            login_deadline = asyncio.get_event_loop().time() + 5.0
-            while not authed:
-                if asyncio.get_event_loop().time() > login_deadline:
-                    raise RuntimeError("OKX WS login timeout")
+        items = msg.get("data") or []
+        if not items:
+            raise RuntimeError("OKX WS order: empty response data")
 
-                raw = await ws.recv()
-                msg = json.loads(raw)
+        it0 = items[0] or {}
+        s_code = str(it0.get("sCode") or "")
+        s_msg = str(it0.get("sMsg") or "")
+        if s_code and s_code != "0":
+            raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
 
-                if msg.get("event") == "error":
-                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
-
-                if msg.get("event") == "login":
-                    if msg.get("code") == "0":
-                        authed = True
-                        break
-                    raise RuntimeError(f"OKX WS login error {msg.get('code')}: {msg.get('msg')}")
-
-            await ws.send(json.dumps(order_msg))
-
-            resp_deadline = asyncio.get_event_loop().time() + 5.0
-            while True:
-                if asyncio.get_event_loop().time() > resp_deadline:
-                    raise RuntimeError("OKX WS order timeout")
-
-                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                msg = json.loads(raw)
-
-                if msg.get("id") != req_id:
-                    continue
-
-                code = str(msg.get("code") or "")
-                if code and code != "0":
-                    err_msg = str(msg.get("msg") or "").strip()
-                    err_items = msg.get("data") or []
-                    err_it0 = err_items[0] if err_items else {}
-                    err_s_code = str((err_it0 or {}).get("sCode") or "")
-                    err_s_msg = str((err_it0 or {}).get("sMsg") or "")
-                    if err_s_code or err_s_msg:
-                        raise RuntimeError(
-                            f"OKX WS order error {code}: {err_msg} (sCode={err_s_code or 'n/a'}, sMsg={err_s_msg})"
-                        )
-                    raise RuntimeError(f"OKX WS order error {code}: {err_msg}")
-
-                items = msg.get("data") or []
-                if not items:
-                    raise RuntimeError("OKX WS order: empty response data")
-
-                it0 = items[0] or {}
-                s_code = str(it0.get("sCode") or "")
-                s_msg = str(it0.get("sMsg") or "")
-                if s_code and s_code != "0":
-                    raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
-
-                return {
-                    "ordId": str(it0.get("ordId") or "0"),
-                    "clOrdId": str(it0.get("clOrdId") or ""),
-                    "sCode": s_code or "0",
-                    "sMsg": s_msg,
-                }
+        return {
+            "ordId": str(it0.get("ordId") or "0"),
+            "clOrdId": str(it0.get("clOrdId") or ""),
+            "sCode": s_code or "0",
+            "sMsg": s_msg,
+        }
 
     #REST: выставление лимитной заявки (limit order)
     async def place_limit_order(
