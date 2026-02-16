@@ -129,6 +129,40 @@ async def md_client_summary(exchange: str, portfolio: str):
 
     return JSONResponse(payload)
 
+@app.get("/md/v2/Clients/{exchange}/{portfolio}/risk")
+async def md_client_risk(exchange: str, portfolio: str):
+    snap = await adapter.get_summaries_snapshot()
+
+    total_eq = float((snap or {}).get("totalEq", 0) or 0)
+    imr = float((snap or {}).get("imr", 0) or 0)
+    mmr = float((snap or {}).get("mmr", 0) or 0)
+
+    by_ccy = (snap or {}).get("byCcy") or []
+    details_imr_sum = 0.0
+    for x in by_ccy:
+        details_imr_sum += float(x.get("imr", 0) or 0)
+    initial_margin = imr if imr != 0 else details_imr_sum
+
+    payload = {
+        "portfolio": portfolio,
+        "exchange": exchange,
+        "portfolioEvaluation": total_eq,
+        "portfolioLiquidationValue": 0,
+        "initialMargin": initial_margin,
+        "minimalMargin": mmr,
+        "correctedMargin": 0,
+        "riskCoverageRatioOne": 0,
+        "riskCoverageRatioTwo": 0,
+        "riskCategoryId": 0,
+        "clientType": None,
+        "hasForbiddenPositions": False,
+        "hasNegativeQuantity": False,
+        "riskStatus": None,
+        "calculationTime": None,
+    }
+
+    return JSONResponse(payload)
+
 @app.get("/md/v2/clients/{client_id}/positions")
 async def md_client_positions(
     client_id: str,
@@ -1623,6 +1657,61 @@ async def cmd_orders_estimate(request: Request): # includeLimitOrders не уч�
     }
     return JSONResponse(out)
 
+@app.get("/commandapi/warptrans/FX1/v2/client/orders/clientsRisk")
+@app.get("/commandapi/warptrans/TRADE/v2/client/orders/clientsRisk")
+async def cmd_orders_clients_risk(
+    portfolio: str,
+    ticker: str,
+    exchange: str = "OKX",
+    board: str | None = None,
+):
+    portfolio = str(portfolio or "").strip()
+    ticker = str(ticker or "").strip()
+    exchange = str(exchange or "OKX").strip()
+    board_s = str(board or "").strip().upper()
+
+    instr = await _get_instr(ticker)
+    inst_type_s = board_s if board_s in SUPPORTED_BOARDS else str((instr or {}).get("instType") or "SPOT").strip().upper()
+
+    is_marginal = False
+    is_short_sell_possible = False
+
+    if inst_type_s == "SPOT":
+        base_ccy, quote_ccy = [p.strip().upper() for p in ticker.split("-", 1)]
+        try:
+            await adapter.get_max_order_size(
+                inst_id=ticker,
+                td_mode="cross",
+                ccy=quote_ccy,
+            )
+            is_marginal = True
+
+            max_loan = await adapter.get_max_loan(
+                inst_id=ticker,
+                mgn_mode="cross",
+                mgn_ccy=base_ccy,
+            )
+            is_short_sell_possible = max_loan > 0
+        except Exception:
+            pass
+    else:
+        is_marginal = True
+        is_short_sell_possible = True
+
+    out = {
+        "portfolio": portfolio,
+        "ticker": ticker,
+        "exchange": exchange,
+        "isMarginal": is_marginal,
+        "isShortSellPossible": is_short_sell_possible,
+        "longMultiplier": 0.0,
+        "shortMultiplier": 0.0,
+        "currencyLongMultiplier": 0.0,
+        "currencyShortMultiplier": 0.0,
+        "isUnitedPortfolio": False,
+    }
+    return JSONResponse(out)
+
 @app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/stop")
 async def create_stop_order(request: Request):
 
@@ -2087,6 +2176,8 @@ async def ws_stream(ws: WebSocket):
                         portfolio=portfolio,
                         existing=existing_flag,
                     )
+                    if payload.get("id") == "0" or payload.get("symbol") == "0" or payload.get("status") == "0":
+                        return
                     # orderStatuses по документации Astras влияет только на первичную историю
                     if apply_status_filter and statuses:
                         st = payload.get("status", "0")
@@ -2533,6 +2624,8 @@ async def ws_stream(ws: WebSocket):
                 subs[sub_guid] = stop
 
                 async def send_trade_astras(t: dict, existing_flag: bool, _guid: str):
+                    if str(t.get("id", "0")) == "0" or str(t.get("symbol", "0")) == "0":
+                        return
                     ts_ms = int(t.get("ts", 0) or 0)
                     date_iso = _iso_from_unix_ms(ts_ms) if ts_ms else None
                     symbol = t.get("symbol") or "N/A"
@@ -2703,8 +2796,10 @@ async def ws_stream(ws: WebSocket):
 
                 unsub_args = [{"channel": "account"}]
                 inst_type_u = (inst_type_s or "SPOT").strip().upper()
-                if inst_type_u in ("FUTURES", "SWAP"):
+                if inst_type_u in ("FUTURES", "SWAP", "MARGIN"):
                     unsub_args.append({"channel": "positions", "instType": inst_type_u})
+                else:
+                    unsub_args.append({"channel": "positions", "instType": "MARGIN"})
 
                 asyncio.create_task(
                     adapter.subscribe_positions(

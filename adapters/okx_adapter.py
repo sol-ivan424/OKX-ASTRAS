@@ -284,18 +284,28 @@ class OkxAdapter:
 
         out: List[dict] = []
         for item in raw.get("data", []):
+            inst_type_item = item.get("instType") or inst_type
+            ct_val = to_opt_float(item.get("ctVal"))
+            exp_ms = self._to_int(item.get("expTime"))
+            cancellation = (
+                datetime.fromtimestamp(exp_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                if exp_ms > 0 else None
+            )
             out.append(
                 {
                     "symbol": item.get("instId") or "",
                     "exchange": "OKX",
-                    "instType": item.get("instType") or inst_type,
+                    "instType": inst_type_item,
+                    "type": inst_type_item,
                     "state": item.get("state"),
                     # SPOT: baseCcy/quoteCcy
                     # FUTURES/SWAP: у OKX quoteCcy часто пустой, валюты берём из settleCcy/ctValCcy
                     "baseCcy": item.get("baseCcy") or item.get("ctValCcy"),
                     "quoteCcy": item.get("quoteCcy") or item.get("settleCcy"),
-                    "ctVal": to_opt_float(item.get("ctVal")),
+                    "ctVal": ct_val,
                     "ctValCcy": item.get("ctValCcy"),
+                    "facevalue": ct_val if str(inst_type_item).upper() in ("FUTURES", "SWAP") else None,
+                    "cancellation": cancellation,
                     "lotSz": to_opt_float(item.get("lotSz")),
                     "tickSz": to_opt_float(item.get("tickSz")),
                 }
@@ -1632,6 +1642,26 @@ class OkxAdapter:
             "maxSell": self._to_float((it0 or {}).get("maxSell")),
         }
 
+    async def get_max_loan(
+        self,
+        inst_id: str,
+        mgn_mode: str,
+        mgn_ccy: str,
+    ) -> float:
+        """
+        OKX REST: GET /api/v5/account/max-loan
+        Возвращает максимально доступный заём по валюте.
+        """
+        params: Dict[str, Any] = {
+            "instId": str(inst_id),
+            "mgnMode": str(mgn_mode),
+            "mgnCcy": str(mgn_ccy),
+        }
+        raw = await self._request_private("GET", "/account/max-loan", params=params)
+        items = raw.get("data") or []
+        it0 = items[0] if items else {}
+        return self._to_float((it0 or {}).get("maxLoan"))
+
     #REST: история сделок (fills-history) — исполнения за последние 3 месяца
     async def get_trades_history(
         self,
@@ -2373,7 +2403,7 @@ class OkxAdapter:
 
         Всегда возвращает:
         - SPOT: валютные остатки (account/balance)
-        - FUTURES + SWAP: позиции по инструментам (account/positions)
+        - MARGIN + FUTURES + SWAP: позиции по инструментам (account/positions)
 
         inst_type из Astras игнорируется — по нашей схеме всегда отдаём все 3 типа.
         """
@@ -2389,8 +2419,8 @@ class OkxAdapter:
         except Exception:
             pass
 
-        # 2) FUTURES и SWAP — позиции по деривативам
-        for itype in ("FUTURES", "SWAP"):
+        # 2) MARGIN, FUTURES и SWAP — позиции по инструментам
+        for itype in ("MARGIN", "FUTURES", "SWAP"):
             try:
                 pos = await self._request_private(
                     "GET",
@@ -2425,8 +2455,7 @@ class OkxAdapter:
 
         # OKX private channels must use private WS URL
         self._assert_private_ws("account", self._ws_private_url)
-        if inst_type_s in ("FUTURES", "SWAP"):
-            self._assert_private_ws("positions", self._ws_private_url)
+        self._assert_private_ws("positions", self._ws_private_url)
 
         async def _call(cb, arg):
             if cb is None:
@@ -2441,8 +2470,10 @@ class OkxAdapter:
         login_msg = self._ws_login_payload()
 
         sub_args: List[Dict[str, Any]] = [{"channel": "account"}]
-        if inst_type_s in ("FUTURES", "SWAP"):
+        if inst_type_s in ("FUTURES", "SWAP", "MARGIN"):
             sub_args.append({"channel": "positions", "instType": inst_type_s})
+        else:
+            sub_args.append({"channel": "positions", "instType": "MARGIN"})
 
         sub_msg = {"op": "subscribe", "args": sub_args}
         unsub_args = unsub_args or sub_msg.get("args")
