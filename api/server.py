@@ -96,6 +96,7 @@ async def md_client_summary(exchange: str, portfolio: str):
     snap = await adapter.get_summaries_snapshot()
 
     total_eq = float((snap or {}).get("totalEq", 0) or 0)
+    adj_eq = float((snap or {}).get("adjEq", 0) or 0)
     avail_eq = float((snap or {}).get("availEq", 0) or 0)
     imr = float((snap or {}).get("imr", 0) or 0)
 
@@ -118,8 +119,8 @@ async def md_client_summary(exchange: str, portfolio: str):
         "buyingPower": avail_eq,
         "profit": 0,
         "profitRate": 0,
-        "portfolioEvaluation": total_eq,
-        "portfolioLiquidationValue": 0,
+        "portfolioEvaluation": adj_eq,
+        "portfolioLiquidationValue": total_eq,
         "initialMargin": initial_margin,
         "correctedMargin": 0,
         "riskBeforeForcePositionClosing": 0,
@@ -229,6 +230,7 @@ async def md_client_positions(
     return JSONResponse(result)
 
 @app.get("/md/v2/Clients/{exchange}/{portfolio}/orders")
+@app.get("/md/v2/clients/{exchange}/{portfolio}/orders")
 async def md_client_orders(
     exchange: str,
     portfolio: str,
@@ -271,6 +273,61 @@ async def md_client_orders(
     except Exception:
         pass
     return JSONResponse(result)
+
+@app.get("/md/v2/Clients/{exchange}/{portfolio}/orders/{orderId}")
+@app.get("/md/v2/clients/{exchange}/{portfolio}/orders/{orderId}")
+async def md_client_order_by_id(
+    exchange: str,
+    portfolio: str,
+    orderId: str,
+):
+    found: dict | None = None
+    try:
+        inst_types = ["SPOT", "FUTURES", "SWAP"]
+
+        if hasattr(adapter, "get_orders_pending"):
+            for it in inst_types:
+                pending = await adapter.get_orders_pending(inst_type=it, inst_id=None)
+                for o in pending or []:
+                    if str(o.get("id") or "") == str(orderId):
+                        found = _astras_order_simple_from_okx_neutral(
+                            o,
+                            exchange=exchange,
+                            portfolio=portfolio,
+                            existing=True,
+                        )
+                        break
+                if found is not None:
+                    break
+
+        if found is None and hasattr(adapter, "get_orders_history"):
+            for it in inst_types:
+                history = await adapter.get_orders_history(inst_type=it, limit=100)
+                for o in history or []:
+                    if str(o.get("id") or "") == str(orderId):
+                        found = _astras_order_simple_from_okx_neutral(
+                            o,
+                            exchange=exchange,
+                            portfolio=portfolio,
+                            existing=True,
+                        )
+                        break
+                if found is not None:
+                    break
+    except Exception:
+        found = None
+
+    if found is None:
+        raise HTTPException(status_code=404, detail=f"Order '{orderId}' not found")
+
+    instr = await _get_instr(found.get("symbol", "") or "")
+    found["board"] = (instr or {}).get("instType") or "0"
+
+    tif = found.get("timeInForce")
+    if isinstance(tif, str) and tif:
+        found["timeInForce"] = tif.lower()
+
+    return JSONResponse(found)
 
 @app.get("/md/v2/Clients/{exchange}/{portfolio}/trades")
 async def md_client_trades(
@@ -968,7 +1025,7 @@ def _astras_order_simple_from_okx_neutral(
         "id": o.get("id", "0"),
         "symbol": symbol,
         "brokerSymbol": broker_symbol,
-        "portfolio": "DEV_portfolio",
+        "portfolio": portfolio,
         "exchange": exchange,
         "comment": None,
         "type": order_type,
@@ -1005,6 +1062,10 @@ _ORDER_IDEMPOTENCY_LIMIT: dict[str, dict] = {} # limit
 _ORDER_IDEMPOTENCY_STOP: dict[str, dict] = {} # stop
 _CWS_MARKET_IDEMPOTENCY: dict[str, dict] = {} # create:market (CWS): guid -> response json
 _CWS_LIMIT_IDEMPOTENCY: dict[str, dict] = {} # create:limit (CWS): guid -> response json
+_CWS_DELETE_MARKET_IDEMPOTENCY: dict[str, dict] = {} # delete:market (CWS): guid -> response json
+_CWS_DELETE_LIMIT_IDEMPOTENCY: dict[str, dict] = {} # delete:limit (CWS): guid -> response json
+_CWS_UPDATE_LIMIT_IDEMPOTENCY: dict[str, dict] = {} # update:limit (CWS): guid -> response json
+_CWS_ORDER_SYMBOL_BY_ID: dict[str, str] = {} # ordId -> symbol
 
 async def _load_ticker_map_for_types(inst_types: list[str]) -> dict[str, dict]:
     results = await asyncio.gather(
@@ -1675,6 +1736,8 @@ async def cmd_orders_clients_risk(
 
     is_marginal = False
     is_short_sell_possible = False
+    long_multiplier = 0.0
+    short_multiplier = 0.0
 
     if inst_type_s == "SPOT":
         base_ccy, quote_ccy = [p.strip().upper() for p in ticker.split("-", 1)]
@@ -1698,14 +1761,34 @@ async def cmd_orders_clients_risk(
         is_marginal = True
         is_short_sell_possible = True
 
+    try:
+        lev_rows = await adapter.get_leverage_info(ticker)
+        lev_long = None
+        lev_short = None
+        for row in lev_rows:
+            pos_side = str((row or {}).get("posSide") or "").strip().lower()
+            lever_raw = (row or {}).get("lever")
+            if lever_raw is None or str(lever_raw).strip() == "":
+                continue
+            lever = float(lever_raw)
+            if pos_side == "long":
+                lev_long = lever
+            elif pos_side == "short":
+                lev_short = lever
+        if lev_long is not None and lev_short is not None:
+            long_multiplier = lev_long
+            short_multiplier = lev_short
+    except Exception:
+        pass
+
     out = {
         "portfolio": portfolio,
         "ticker": ticker,
         "exchange": exchange,
         "isMarginal": is_marginal,
         "isShortSellPossible": is_short_sell_possible,
-        "longMultiplier": 0.0,
-        "shortMultiplier": 0.0,
+        "longMultiplier": long_multiplier,
+        "shortMultiplier": short_multiplier,
         "currencyLongMultiplier": 0.0,
         "currencyShortMultiplier": 0.0,
         "isUnitedPortfolio": False,
@@ -2849,6 +2932,7 @@ async def ws_stream(ws: WebSocket):
 
                 async def send_summary_astras(s: dict, _guid: str):
                     total_eq = float(s.get("totalEq", 0) or 0)
+                    adj_eq = float(s.get("adjEq", 0) or 0)
                     avail_eq = float(s.get("availEq", 0) or 0)
                     imr = float(s.get("imr", 0) or 0)
                     by_ccy = s.get("byCcy") or []
@@ -2869,8 +2953,8 @@ async def ws_stream(ws: WebSocket):
                         "buyingPower": avail_eq,
                         "profit": 0,
                         "profitRate": 0,
-                        "portfolioEvaluation": total_eq,
-                        "portfolioLiquidationValue": 0,
+                        "portfolioEvaluation": adj_eq,
+                        "portfolioLiquidationValue": total_eq,
                         "initialMargin": initial_margin,
                         "correctedMargin": 0,
                         "riskBeforeForcePositionClosing": 0,
@@ -2985,7 +3069,6 @@ async def cws_stream(ws: WebSocket):
                 break
 
             opcode = msg.get("opcode")
-            token = msg.get("token")
             req_guid = msg.get("guid")
 
             if opcode == "authorize":
@@ -3067,6 +3150,7 @@ async def cws_stream(ws: WebSocket):
                     "message": f"An order '{ord_id}' has been created.",
                     "orderNumber": ord_id,
                 }
+                _CWS_ORDER_SYMBOL_BY_ID[ord_id] = symbol
                 if bool(check_duplicates):
                     _CWS_MARKET_IDEMPOTENCY[order_guid] = out
 
@@ -3120,8 +3204,6 @@ async def cws_stream(ws: WebSocket):
 
                 if inst_type_s in ("FUTURES", "SWAP"):
                     td_mode = "cross"
-                elif inst_type_s == "SPOT":
-                    td_mode = "cross" if allow_margin else "cash"
                 else:
                     td_mode = "cross" if allow_margin else "cash"
 
@@ -3152,8 +3234,162 @@ async def cws_stream(ws: WebSocket):
                     "message": f"An order '{ord_id}' has been created.",
                     "orderNumber": ord_id,
                 }
+                _CWS_ORDER_SYMBOL_BY_ID[ord_id] = symbol
                 if bool(check_duplicates):
                     _CWS_LIMIT_IDEMPOTENCY[order_guid] = out
+
+                await safe_send_json(out)
+                continue
+
+            # снятие заявки (Astras CWS: delete:market/delete:limit)
+            if opcode in ("delete:market", "delete:limit"):
+                order_guid = msg.get("guid") or req_guid
+                if not order_guid:
+                    await send_error_and_close(None, 400, "guid is required")
+                    raise WebSocketDisconnect
+                okx_client_id = _okx_client_id(order_guid)
+
+                check_duplicates = msg.get("checkDuplicates", True)
+                delete_idempotency = (
+                    _CWS_DELETE_MARKET_IDEMPOTENCY
+                    if opcode == "delete:market"
+                    else _CWS_DELETE_LIMIT_IDEMPOTENCY
+                )
+                if bool(check_duplicates) and order_guid in delete_idempotency:
+                    await safe_send_json(delete_idempotency[order_guid])
+                    continue
+
+                order_id = str(msg.get("orderId") or "").strip()
+                if not order_id:
+                    await send_error_and_close(order_guid, 400, "orderId is required")
+                    raise WebSocketDisconnect
+
+                symbol = _CWS_ORDER_SYMBOL_BY_ID.get(order_id, "")
+
+                cancel_inst_type = None
+                if symbol:
+                    instr_for_cancel = await _get_instr(symbol)
+                    cancel_inst_type = str((instr_for_cancel or {}).get("instType") or "").strip().upper() or None
+
+                try:
+                    res = await adapter.cancel_order_ws(
+                        symbol=symbol or "",
+                        order_id=order_id,
+                        inst_type=cancel_inst_type,
+                        ws_request_id=okx_client_id,
+                    )
+                except Exception as e:
+                    err_text = str(e).strip()
+                    if not err_text:
+                        err_text = type(e).__name__
+                    await send_error_and_close(order_guid, 502, err_text)
+                    raise WebSocketDisconnect
+
+                ord_id = str(res.get("ordId") or order_id or "0")
+                out = {
+                    "requestGuid": order_guid,
+                    "httpCode": 200,
+                    "message": f"An order '{ord_id}' has been deleted.",
+                    "orderNumber": ord_id,
+                }
+                _CWS_ORDER_SYMBOL_BY_ID.pop(ord_id, None)
+                if bool(check_duplicates):
+                    delete_idempotency[order_guid] = out
+
+                await safe_send_json(out)
+                continue
+
+            # изменение лимитной заявки (Astras CWS: update:limit)
+            if opcode == "update:limit":
+                order_guid = msg.get("guid") or req_guid
+                if not order_guid:
+                    await send_error_and_close(None, 400, "guid is required")
+                    raise WebSocketDisconnect
+                okx_client_id = _okx_client_id(order_guid)
+
+                check_duplicates = msg.get("checkDuplicates", True)
+                if bool(check_duplicates) and order_guid in _CWS_UPDATE_LIMIT_IDEMPOTENCY:
+                    await safe_send_json(_CWS_UPDATE_LIMIT_IDEMPOTENCY[order_guid])
+                    continue
+
+                order_id = str(msg.get("orderId") or "").strip()
+                if not order_id:
+                    await send_error_and_close(order_guid, 400, "orderId is required")
+                    raise WebSocketDisconnect
+
+                side = (msg.get("side") or "").lower()
+                qty = msg.get("quantity")
+                price = msg.get("price")
+                instr = msg.get("instrument") or {}
+                symbol = instr.get("symbol")
+                inst_type = (
+                    instr.get("instrumentGroup")
+                    or instr.get("board")
+                    or msg.get("instrumentGroup")
+                    or msg.get("board")
+                )
+                allow_margin = bool(msg.get("allowMargin", False))
+                inst_type_s = str(inst_type).strip().upper() if inst_type is not None else ""
+                ccy = await _resolve_order_ccy(symbol, inst_type_s, side, allow_margin)
+
+                if inst_type_s in ("FUTURES", "SWAP"):
+                    td_mode = "cross"
+                else:
+                    td_mode = "cross" if allow_margin else "cash"
+                cancel_req_id = _okx_client_id(f"{order_guid}:cancel")
+                new_req_id = _okx_client_id(f"{order_guid}:new")
+
+                cancel_symbol = symbol or _CWS_ORDER_SYMBOL_BY_ID.get(order_id, "")
+                cancel_inst_type = None
+                if cancel_symbol:
+                    instr_for_cancel = await _get_instr(cancel_symbol)
+                    cancel_inst_type = str((instr_for_cancel or {}).get("instType") or "").strip().upper() or None
+
+                try:
+                    await adapter.cancel_order_ws(
+                        symbol=cancel_symbol,
+                        order_id=order_id,
+                        inst_type=cancel_inst_type,
+                        ws_request_id=cancel_req_id,
+                    )
+                except Exception as e:
+                    err_text = str(e).strip()
+                    if not err_text:
+                        err_text = type(e).__name__
+                    await send_error_and_close(order_guid, 400, err_text)
+                    raise WebSocketDisconnect
+
+                try:
+                    res = await adapter.place_limit_order_ws(
+                        symbol=symbol,
+                        side=side,
+                        quantity=qty,
+                        price=price,
+                        inst_type=inst_type_s,
+                        ord_type="limit",
+                        td_mode=td_mode,
+                        ccy=ccy,
+                        cl_ord_id=okx_client_id,
+                        ws_request_id=new_req_id,
+                    )
+                except Exception as e:
+                    err_text = str(e).strip()
+                    if not err_text:
+                        err_text = type(e).__name__
+                    await send_error_and_close(order_guid, 400, err_text)
+                    raise WebSocketDisconnect
+
+                new_ord_id = str(res.get("ordId") or "0")
+                out = {
+                    "requestGuid": order_guid,
+                    "httpCode": 200,
+                    "message": f"An order has been updated. New order ID is '{new_ord_id}'.",
+                    "orderNumber": new_ord_id,
+                }
+                _CWS_ORDER_SYMBOL_BY_ID.pop(order_id, None)
+                _CWS_ORDER_SYMBOL_BY_ID[new_ord_id] = symbol
+                if bool(check_duplicates):
+                    _CWS_UPDATE_LIMIT_IDEMPOTENCY[order_guid] = out
 
                 await safe_send_json(out)
                 continue

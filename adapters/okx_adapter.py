@@ -918,6 +918,34 @@ class OkxAdapter:
                 raise last_err
             raise RuntimeError("OKX WS order error")
 
+    async def _cancel_order_via_private_ws(self, body: Dict[str, Any], req_id: str) -> Dict[str, Any]:
+        cancel_msg = {"id": req_id, "op": "cancel-order", "args": [body]}
+
+        async with self._order_ws_req_lock:
+            last_err = None
+            for _ in range(2):
+                ws = await self._ensure_order_ws()
+                try:
+                    await ws.send(json.dumps(cancel_msg))
+
+                    resp_deadline = asyncio.get_event_loop().time() + 5.0
+                    while True:
+                        if asyncio.get_event_loop().time() > resp_deadline:
+                            raise RuntimeError("OKX WS cancel-order timeout")
+
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        msg = json.loads(raw)
+                        if msg.get("id") != req_id:
+                            continue
+                        return msg
+                except Exception as e:
+                    last_err = e
+                    await self._close_order_ws()
+                    continue
+            if last_err is not None:
+                raise last_err
+            raise RuntimeError("OKX WS cancel-order error")
+
     #парсер ордера OKX (REST и WS) в нейтральный формат
     def _parse_okx_order_any(self, d: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1415,6 +1443,54 @@ class OkxAdapter:
             "sMsg": s_msg,
         }
 
+    async def cancel_order_ws(
+        self,
+        symbol: str,
+        order_id: str,
+        inst_type: Optional[str] = None,
+        ws_request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"ordId": str(order_id)}
+        if isinstance(symbol, str) and symbol.strip():
+            body["instId"] = str(symbol).strip()
+            if inst_type is not None and str(inst_type).strip():
+                inst_id_code = await self._resolve_inst_id_code(str(symbol).strip(), str(inst_type).strip().upper())
+                if inst_id_code:
+                    body["instIdCode"] = str(inst_id_code)
+
+        req_id = str(ws_request_id or f"cancel-{uuid.uuid4().hex}")
+        msg = await self._cancel_order_via_private_ws(body, req_id)
+
+        code = str(msg.get("code") or "")
+        if code and code != "0":
+            err_msg = str(msg.get("msg") or "").strip()
+            err_items = msg.get("data") or []
+            err_it0 = err_items[0] if err_items else {}
+            err_s_code = str((err_it0 or {}).get("sCode") or "")
+            err_s_msg = str((err_it0 or {}).get("sMsg") or "")
+            if err_s_code or err_s_msg:
+                raise RuntimeError(
+                    f"OKX WS cancel-order error {code}: {err_msg} (sCode={err_s_code or 'n/a'}, sMsg={err_s_msg})"
+                )
+            raise RuntimeError(f"OKX WS cancel-order error {code}: {err_msg}")
+
+        items = msg.get("data") or []
+        if not items:
+            raise RuntimeError("OKX WS cancel-order: empty response data")
+
+        it0 = items[0] or {}
+        s_code = str(it0.get("sCode") or "")
+        s_msg = str(it0.get("sMsg") or "")
+        if s_code and s_code != "0":
+            raise RuntimeError(f"OKX cancel-order error {s_code}: {s_msg}")
+
+        return {
+            "ordId": str(it0.get("ordId") or order_id or "0"),
+            "clOrdId": str(it0.get("clOrdId") or ""),
+            "sCode": s_code or "0",
+            "sMsg": s_msg,
+        }
+
     #REST: выставление лимитной заявки (limit order)
     async def place_limit_order(
         self,
@@ -1661,6 +1737,14 @@ class OkxAdapter:
         items = raw.get("data") or []
         it0 = items[0] if items else {}
         return self._to_float((it0 or {}).get("maxLoan"))
+
+    async def get_leverage_info(self, inst_id: str) -> List[Dict[str, Any]]:
+        raw = await self._request_private(
+            "GET",
+            "/account/leverage-info",
+            params={"instId": str(inst_id)},
+        )
+        return raw.get("data") or []
 
     #REST: история сделок (fills-history) — исполнения за последние 3 месяца
     async def get_trades_history(
@@ -2599,6 +2683,7 @@ class OkxAdapter:
     # Summaries (сводная информация по "портфелю" = аккаунту OKX)
     def _parse_okx_account_summary_any(self, acc: Dict[str, Any]) -> Dict[str, Any]:
         total_eq = self._to_float(acc.get("totalEq"))
+        adj_eq = self._to_float(acc.get("adjEq"))
         avail_eq = self._to_float(acc.get("availEq"))
         imr = self._to_float(acc.get("imr"))
         mmr = self._to_float(acc.get("mmr"))
@@ -2616,6 +2701,7 @@ class OkxAdapter:
             )
         return {
             "totalEq": total_eq,
+            "adjEq": adj_eq,
             "availEq": avail_eq,
             "imr": imr,
             "mmr": mmr,
