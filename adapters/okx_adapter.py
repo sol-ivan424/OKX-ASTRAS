@@ -356,13 +356,11 @@ class OkxAdapter:
         self._inst_id_code_cache_ts = time.time()
 
     async def _ensure_inst_id_code_cache(self) -> None:
-        now = time.time()
-        if self._inst_id_code_cache and (now - self._inst_id_code_cache_ts) < self._inst_id_code_cache_ttl_sec:
+        if self._inst_id_code_cache:
             return
 
         async with self._inst_id_code_cache_lock:
-            now = time.time()
-            if self._inst_id_code_cache and (now - self._inst_id_code_cache_ts) < self._inst_id_code_cache_ttl_sec:
+            if self._inst_id_code_cache:
                 return
             await self._refresh_inst_id_code_cache()
 

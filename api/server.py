@@ -51,12 +51,12 @@ def _okx_client_id(guid: str | None) -> str:
 
 app = FastAPI(title="Astras Crypto Gateway")
 adapter = _make_adapter()
-
+"""
 @app.on_event("startup")
 async def _warmup_okx():
     await adapter._ensure_order_ws()
     await adapter._ensure_inst_id_code_cache()
-
+"""
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,7 +73,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+"""
 from fastapi import Body
 USER_SETTINGS: dict[str, str] = {}
 @app.post("/commandapi/observatory/subscriptions/actions/addToken")
@@ -90,7 +90,7 @@ def user_settings(serviceName: str = Query(default="Astras"), key: str | None = 
 def widget_settings(serviceName: str = Query(default="Astras")):
     # Пустой набор настроек виджетов
     return JSONResponse([])
-
+"""
 @app.get("/md/v2/Clients/{exchange}/{portfolio}/summary")
 async def md_client_summary(exchange: str, portfolio: str):
     snap = await adapter.get_summaries_snapshot()
@@ -335,81 +335,239 @@ async def md_client_trades(
     portfolio: str,
     format: str = "heavy",
 ):
-    fmt = (format or "heavy").strip().lower()
-    if fmt not in ("heavy", "simple", "slim"):
-        fmt = "heavy"
     result: list[dict] = []
-    try:
-        inst_types = ["SPOT", "FUTURES", "SWAP"]
-        if hasattr(adapter, "get_trades_history"):
-            for it in inst_types:
-                trades = await adapter.get_trades_history(inst_type=it, limit=100)
-                for t in trades or []:
-                    symbol = t.get("symbol") or t.get("instId") or "[N/A]"
-                    inst_id = t.get("instId") or t.get("inst_id") or t.get("symbol")
-                    currency = None
-                    if inst_id and "-" in str(inst_id):
-                        parts = [p for p in str(inst_id).split("-") if p]
-                        if len(parts) >= 2:
-                            currency = parts[1].strip() or None
-                    date_iso = t.get("date")
-                    if not date_iso:
-                        ts_ms = t.get("ts") or t.get("fillTime") or t.get("ts_fill")
-                        try:
-                            date_iso = _iso_from_unix_ms(int(ts_ms)) if ts_ms else None
-                        except Exception:
-                            date_iso = None
-                    price = t.get("price")
-                    qty_units = t.get("qtyUnits")
-                    if qty_units is None:
-                        qty_units = t.get("qty")
+    cutoff_ms = int(time.time() * 1000) - 24 * 60 * 60 * 1000
+    inst_types = ["SPOT", "FUTURES", "SWAP"]
+    for it in inst_types:
+        trades = await adapter.get_trades_history(inst_type=it, limit=100)
+        for t in trades or []:
+            ts_ms = t.get("ts") or t.get("fillTime") or t.get("ts_fill")
+            try:
+                ts_ms_i = int(ts_ms) if ts_ms is not None else 0
+            except Exception:
+                ts_ms_i = 0
+            if ts_ms_i <= 0 or ts_ms_i < cutoff_ms:
+                continue
 
-                    try:
-                        qty_units_f = float(qty_units) if qty_units is not None else 0.0
-                    except Exception:
-                        qty_units_f = 0.0
-                    try:
-                        price_f = float(price) if price is not None else 0.0
-                    except Exception:
-                        price_f = 0.0
+            symbol = t.get("symbol") or t.get("instId") or "[N/A]"
+            inst_id = t.get("instId") or t.get("inst_id") or t.get("symbol")
+            currency = None
+            if inst_id and "-" in str(inst_id):
+                parts = [p for p in str(inst_id).split("-") if p]
+                if len(parts) >= 2:
+                    currency = parts[1].strip() or None
 
-                    volume = t.get("volume")
-                    value = t.get("value")
-                    if volume is None:
-                        volume = price_f * qty_units_f
-                    if value is None:
-                        value = volume
-                    board = t.get("board") or t.get("instType") or t.get("inst_type") or "0"
-                    result.append(
-                        {
-                            "id": str(t.get("id") or "0"),
-                            "orderNo": str(t.get("orderNo") or t.get("orderno") or t.get("orderId") or "0"),
-                            "comment": t.get("comment"),
-                            "symbol": symbol,
-                            "shortName": symbol,
-                            "brokerSymbol": f"{exchange}:{symbol}",
-                            "exchange": exchange,
-                            "date": date_iso,
-                            "board": board,
-                            "qtyUnits": qty_units_f,
-                            "qtyBatch": t.get("qtyBatch", 0) or 0,
-                            "qty": t.get("qty", qty_units_f),
-                            "price": price_f,
-                            "currency": currency,
-                            "accruedInt": t.get("accruedInt", 0) or 0,
-                            "side": t.get("side") or "0",
-                            "existing": bool(t.get("existing", True)),
-                            "commission": t.get("commission"),
-                            "repoSpecificFields": None,
-                            "volume": volume,
-                            "settleDate": t.get("settleDate"),  # пока null, не даёт OKX
-                            "value": value,
-                        }
-                    )
-    except Exception:
-        pass
+            date_iso = t.get("date") or _iso_from_unix_ms(ts_ms_i)
+            price = t.get("price")
+            qty_units = t.get("qtyUnits")
+            if qty_units is None:
+                qty_units = t.get("qty")
+
+            try:
+                qty_units_f = float(qty_units) if qty_units is not None else 0.0
+            except Exception:
+                qty_units_f = 0.0
+            if qty_units_f <= 0:
+                continue
+
+            try:
+                price_f = float(price) if price is not None else 0.0
+            except Exception:
+                price_f = 0.0
+
+            volume = t.get("volume")
+            value = t.get("value")
+            if volume is None:
+                volume = price_f * qty_units_f
+            if value is None:
+                value = volume
+            board = t.get("board") or t.get("instType") or t.get("inst_type") or "0"
+            result.append(
+                {
+                    "id": str(t.get("id") or "0"),
+                    "orderNo": str(t.get("orderNo") or t.get("orderno") or t.get("orderId") or "0"),
+                    "comment": t.get("comment"),
+                    "symbol": symbol,
+                    "shortName": symbol,
+                    "brokerSymbol": f"{exchange}:{symbol}",
+                    "exchange": exchange,
+                    "date": date_iso,
+                    "board": board,
+                    "qtyUnits": qty_units_f,
+                    "qtyBatch": t.get("qtyBatch", 0) or 0,
+                    "qty": t.get("qty", qty_units_f),
+                    "price": price_f,
+                    "currency": currency,
+                    "accruedInt": t.get("accruedInt", 0) or 0,
+                    "side": t.get("side") or "0",
+                    "existing": bool(t.get("existing", True)),
+                    "commission": t.get("commission"),
+                    "repoSpecificFields": None,
+                    "volume": volume,
+                    "settleDate": t.get("settleDate"),  # пока null, не даёт OKX
+                    "value": value,
+                }
+            )
     return JSONResponse(result)
 
+
+@app.get("/md/v2/Stats/{exchange}/{portfolio}/history/trades")
+@app.get("/md/v2/stats/{exchange}/{portfolio}/history/trades")
+async def md_stats_history_trades(
+    exchange: str,
+    portfolio: str,
+    instrumentGroup: str | None = None,
+    dateFrom: str | None = None,
+    ticker: str | None = None,
+    from_: int | None = Query(default=None, alias="from"),
+    limit: int = 50,
+    orderByTradeDate: bool = False,
+    descending: bool = False,
+    withRepo: bool = False,
+    side: str | None = None,
+    format: str = "heavy",
+    jsonResponse: bool = False,
+):
+    _ = withRepo, format, jsonResponse
+    limit_i = max(1, min(limit, 1000))
+    inst_group = str(instrumentGroup or "").strip().upper()
+    inst_types = [inst_group] if inst_group in ("SPOT", "FUTURES", "SWAP") else ["SPOT", "FUTURES", "SWAP"]
+    ticker_s = str(ticker or "").strip().upper().replace("_", "-")
+    side_s = str(side or "").strip().lower()
+    from_i = from_
+    cutoff_ms = int(time.time() * 1000) - 24 * 60 * 60 * 1000
+
+    date_from_ms: int | None = None
+    if dateFrom:
+        s = str(dateFrom).strip()
+        try:
+            if "T" not in s:
+                s = f"{s}T00:00:00"
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            date_from_ms = int(dt.timestamp() * 1000)
+        except Exception:
+            date_from_ms = None
+
+    rows: list[tuple[int, int, dict]] = []
+    for it in inst_types:
+        after_cursor: str | None = None
+        while len(rows) < limit_i:
+            params = {"instType": it, "limit": "100"}
+            if after_cursor:
+                params["after"] = after_cursor
+            raw = await adapter._request_private("GET", "/trade/fills-history", params=params)
+            page = raw.get("data") or []
+            if not page:
+                break
+
+            for item in page:
+                t = adapter._parse_okx_trade_any(item, is_history=True, inst_type=it)
+                ts_ms = t.get("ts") or t.get("fillTime") or t.get("ts_fill")
+                try:
+                    ts_ms_i = int(ts_ms) if ts_ms is not None else 0
+                except Exception:
+                    ts_ms_i = 0
+                if ts_ms_i <= 0:
+                    continue
+                if ts_ms_i >= cutoff_ms:
+                    continue
+                if date_from_ms is not None and ts_ms_i < date_from_ms:
+                    continue
+
+                symbol = t.get("symbol") or t.get("instId") or "[N/A]"
+                symbol_s = str(symbol).upper().replace("_", "-")
+                if ticker_s and symbol_s != ticker_s:
+                    continue
+                if side_s and str(t.get("side") or "").lower() != side_s:
+                    continue
+
+                try:
+                    trade_id_i = int(str(t.get("id") or "0"))
+                except Exception:
+                    trade_id_i = 0
+                if from_i is not None:
+                    if descending and trade_id_i > from_i:
+                        continue
+                    if (not descending) and trade_id_i < from_i:
+                        continue
+
+                inst_id = t.get("instId") or t.get("inst_id") or t.get("symbol")
+                currency = None
+                if inst_id and "-" in str(inst_id):
+                    parts = [p for p in str(inst_id).split("-") if p]
+                    if len(parts) >= 2:
+                        currency = parts[1].strip() or None
+
+                date_iso = t.get("date") or _iso_from_unix_ms(ts_ms_i)
+                price = t.get("price")
+                qty_units = t.get("qtyUnits")
+                if qty_units is None:
+                    qty_units = t.get("qty")
+                try:
+                    qty_units_f = float(qty_units) if qty_units is not None else 0.0
+                except Exception:
+                    qty_units_f = 0.0
+                if qty_units_f <= 0:
+                    continue
+
+                try:
+                    price_f = float(price) if price is not None else 0.0
+                except Exception:
+                    price_f = 0.0
+
+                volume = t.get("volume")
+                value = t.get("value")
+                if volume is None:
+                    volume = price_f * qty_units_f
+                if value is None:
+                    value = volume
+                board = t.get("board") or t.get("instType") or t.get("inst_type") or "0"
+
+                payload = {
+                    "id": str(t.get("id") or "0"),
+                    "orderNo": str(t.get("orderNo") or t.get("orderno") or t.get("orderId") or "0"),
+                    "comment": t.get("comment"),
+                    "symbol": symbol,
+                    "shortName": symbol,
+                    "brokerSymbol": f"{exchange}:{symbol}",
+                    "exchange": exchange,
+                    "date": date_iso,
+                    "board": board,
+                    "qtyUnits": qty_units_f,
+                    "qtyBatch": t.get("qtyBatch", 0) or 0,
+                    "qty": t.get("qty", qty_units_f),
+                    "price": price_f,
+                    "currency": currency,
+                    "accruedInt": t.get("accruedInt", 0) or 0,
+                    "side": t.get("side") or "0",
+                    "existing": bool(t.get("existing", True)),
+                    "commission": t.get("commission"),
+                    "repoSpecificFields": None,
+                    "volume": volume,
+                    "settleDate": t.get("settleDate"),
+                    "value": value,
+                }
+                rows.append((ts_ms_i, trade_id_i, payload))
+                if len(rows) >= limit_i:
+                    break
+
+            if len(rows) >= limit_i:
+                break
+            last = page[-1] or {}
+            after_cursor = str(last.get("tradeId") or last.get("billId") or "").strip() or None
+            if len(page) < 100 or not after_cursor:
+                break
+        if len(rows) >= limit_i:
+            break
+
+    key_idx = 0 if orderByTradeDate else 1
+    rows.sort(key=lambda x: x[key_idx], reverse=bool(descending))
+    out = [x[2] for x in rows[:limit_i]]
+    return JSONResponse(out)
+
+"""
 @app.post("/identity/v5/UserSettings")
 @app.put("/identity/v5/UserSettings")
 def user_settings_write(
@@ -438,7 +596,7 @@ def user_settings_delete(
 @app.put("/identity/v5/UserSettings/group/widget-settings")
 def widget_settings_write(payload: dict = Body(default={})):
     return {"ok": True}
-
+"""
 @app.get("/client/v1.0/users/{user_id}/all-portfolios")
 def all_portfolios(user_id: str):
     # OKX: считаем весь аккаунт одним "портфелем" для Astras
