@@ -3,28 +3,17 @@ import time
 import uuid
 import hashlib
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Query
 from typing import List, Optional
 import asyncio
 import datetime
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketState
 from adapters.okx_adapter import OkxAdapter
+from fastapi.middleware.cors import CORSMiddleware
 
 from dotenv import load_dotenv
 load_dotenv()
-
-"""
-def _astras_error(request_guid: str | None, http_code: int, message: str, status_code: int | None = None):
-    return JSONResponse(
-        {
-            "requestGuid": request_guid or "",
-            "httpCode": int(http_code),
-            "message": str(message),
-        },
-        status_code=int(status_code if status_code is not None else http_code),
-    )
-"""
 
 def _make_adapter():
     name = os.getenv("ADAPTER", "okx").lower()
@@ -51,15 +40,11 @@ def _okx_client_id(guid: str | None) -> str:
 
 app = FastAPI(title="Astras Crypto Gateway")
 adapter = _make_adapter()
-"""
+
 @app.on_event("startup")
 async def _warmup_okx():
     await adapter._ensure_order_ws()
     await adapter._ensure_inst_id_code_cache()
-"""
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,7 +58,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-"""
+
 from fastapi import Body
 USER_SETTINGS: dict[str, str] = {}
 @app.post("/commandapi/observatory/subscriptions/actions/addToken")
@@ -90,7 +75,7 @@ def user_settings(serviceName: str = Query(default="Astras"), key: str | None = 
 def widget_settings(serviceName: str = Query(default="Astras")):
     # Пустой набор настроек виджетов
     return JSONResponse([])
-"""
+
 @app.get("/md/v2/Clients/{exchange}/{portfolio}/summary")
 async def md_client_summary(exchange: str, portfolio: str):
     snap = await adapter.get_summaries_snapshot()
@@ -173,17 +158,11 @@ async def md_client_positions(
     withoutCurrency: bool = False,
     jsonResponse: bool = False,
 ):
-    #Используем тот же snapshot, что и в WS PositionsGetAndSubscribeV2.
-    #exchange_out = exchange or "OKX"
     exchange_out = exchange or "OKX"
-    portfolio_out = portfolio or client_id
+    portfolio_out = portfolio or "DEV_portfolio"
     result: list[dict] = []
     try:
-        snapshot = []
-        if hasattr(adapter, "get_positions_snapshot"):
-            snapshot = await adapter.get_positions_snapshot(inst_type=None)
-        elif hasattr(adapter, "get_positions"):
-            snapshot = await adapter.get_positions(inst_type=None)
+        snapshot = await adapter.get_positions_snapshot(inst_type=None)
         for p in snapshot or []:
             # фильтр валют (если нужно)
             if withoutCurrency and p.get("isCurrency"):
@@ -201,7 +180,7 @@ async def md_client_positions(
                 "currentVolume": current_volume,
                 "symbol": symbol,
                 "brokerSymbol": f"{exchange_out}:{symbol}",
-                "portfolio": "DEV_portfolio",
+                "portfolio": portfolio_out,
                 "exchange": exchange_out,
                 "avgPrice": avg_price,
                 "qtyUnits": qty_units,
@@ -239,37 +218,35 @@ async def md_client_orders(
     try:
         inst_types = ["SPOT", "FUTURES", "SWAP"]
         # 1) история заявок
-        if hasattr(adapter, "get_orders_history"):
-            for it in inst_types:
-                history = await adapter.get_orders_history(
-                    inst_type=it,
-                    limit=100,
-                )
-                for o in history or []:
-                    result.append(
-                        _astras_order_simple_from_okx_neutral(
-                            o,
-                            exchange=exchange,
-                            portfolio=portfolio,
-                            existing=True,   # REST = snapshot
-                        )
+        for it in inst_types:
+            history = await adapter.get_orders_history(
+                inst_type=it,
+                limit=100,
+            )
+            for o in history or []:
+                result.append(
+                    _astras_order_simple_from_okx_neutral(
+                        o,
+                        exchange=exchange,
+                        portfolio=portfolio,
+                        existing=True,   # REST = snapshot
                     )
+                )
         # 2) активные заявки (pending)
-        if hasattr(adapter, "get_orders_pending"):
-            for it in inst_types:
-                pending = await adapter.get_orders_pending(
-                    inst_type=it,
-                    inst_id=None,
-                )
-                for o in pending or []:
-                    result.append(
-                        _astras_order_simple_from_okx_neutral(
-                            o,
-                            exchange=exchange,
-                            portfolio=portfolio,
-                            existing=True,   # REST = snapshot
-                        )
+        for it in inst_types:
+            pending = await adapter.get_orders_pending(
+                inst_type=it,
+                inst_id=None,
+            )
+            for o in pending or []:
+                result.append(
+                    _astras_order_simple_from_okx_neutral(
+                        o,
+                        exchange=exchange,
+                        portfolio=portfolio,
+                        existing=True,   # REST = snapshot
                     )
+                )
     except Exception:
         pass
     return JSONResponse(result)
@@ -285,22 +262,21 @@ async def md_client_order_by_id(
     try:
         inst_types = ["SPOT", "FUTURES", "SWAP"]
 
-        if hasattr(adapter, "get_orders_pending"):
-            for it in inst_types:
-                pending = await adapter.get_orders_pending(inst_type=it, inst_id=None)
-                for o in pending or []:
-                    if str(o.get("id") or "") == str(orderId):
-                        found = _astras_order_simple_from_okx_neutral(
-                            o,
-                            exchange=exchange,
-                            portfolio=portfolio,
-                            existing=True,
-                        )
-                        break
-                if found is not None:
+        for it in inst_types:
+            pending = await adapter.get_orders_pending(inst_type=it, inst_id=None)
+            for o in pending or []:
+                if str(o.get("id") or "") == str(orderId):
+                    found = _astras_order_simple_from_okx_neutral(
+                        o,
+                        exchange=exchange,
+                        portfolio=portfolio,
+                        existing=True,
+                    )
                     break
+            if found is not None:
+                break
 
-        if found is None and hasattr(adapter, "get_orders_history"):
+        if found is None:
             for it in inst_types:
                 history = await adapter.get_orders_history(inst_type=it, limit=100)
                 for o in history or []:
@@ -567,7 +543,7 @@ async def md_stats_history_trades(
     out = [x[2] for x in rows[:limit_i]]
     return JSONResponse(out)
 
-"""
+
 @app.post("/identity/v5/UserSettings")
 @app.put("/identity/v5/UserSettings")
 def user_settings_write(
@@ -596,7 +572,7 @@ def user_settings_delete(
 @app.put("/identity/v5/UserSettings/group/widget-settings")
 def widget_settings_write(payload: dict = Body(default={})):
     return {"ok": True}
-"""
+
 @app.get("/client/v1.0/users/{user_id}/all-portfolios")
 def all_portfolios(user_id: str):
     # OKX: считаем весь аккаунт одним "портфелем" для Astras
@@ -612,33 +588,10 @@ def all_portfolios(user_id: str):
         }
     ])
 
-@app.get("/identity/v5/UserSettings/group/watchlist-collection")
-def watchlist_collection(serviceName: str = Query(default="Astras")):
-    # Пустой набор списков наблюдения
-    return JSONResponse([])
-
-@app.get("/client/v2.0/agreements/{agreement}/portfolios/{portfolio}/dynamics")
-def portfolio_dynamics_stub(
-    agreement: str,
-    portfolio: str,
-    startDate: str | None = None,
-    endDate: str | None = None,
-):
-
-    return JSONResponse([])
-
-@app.get("/commandapi/observatory/subscriptions")
-def list_subscriptions():
-    # Astras UI запрашивает список подписок observatory. В DEV режиме вернём пусто.
-    return JSONResponse([])
-
 @app.post("/hyperion")
 async def hyperion(request: Request):
     """
     GraphQL endpoint для Astras (виджет «Все инструменты»).
-
-    Главная цель: НЕ ловить 504.
-    Поэтому здесь нельзя синхронно ждать OKX REST бесконечно.
     """
     body = await request.json()
     variables = body.get("variables", {}) or {}
@@ -1326,11 +1279,6 @@ async def _resolve_order_ccy(
             return str(ccy).strip().upper()
     return None
 
-async def _astras_instruments() -> list[dict]:
-    # Единый источник инструментов (как и /v2/instruments)
-    await _ensure_instr_cache()
-    return [_astras_instrument_simple(x) for x in list(_INSTR_CACHE.values())]
-
 @app.get("/md/v2/Securities/{broker_symbol}/quotes")
 async def md_quotes(broker_symbol: str):
     # broker_symbol приходит как "OKX:BTC-USDT"
@@ -1460,25 +1408,6 @@ async def md_security_available_boards(
 def md_boards():
     return JSONResponse(SUPPORTED_BOARDS)
 
-@app.get("/instruments/v1/TreeMap")
-async def instruments_treemap(market: str | None = None, limit: int = 50):
-    if not _INSTR_CACHE:
-        await _refresh_instr_cache()
-
-    items = list(_INSTR_CACHE.values())
-    items = items[: max(1, min(limit, 1000))]
-    out = []
-    for raw in items:
-        x = _astras_instrument_simple(raw)
-
-        x["exchange"] = "OKX"
-        x["board"] = "SPOT"
-        x["primary_board"] = "SPOT"
-
-        out.append(x)
-
-    return JSONResponse({"displayItems": out})
-
 @app.get("/md/v2/history")
 async def md_history(
     symbol: str,
@@ -1506,31 +1435,30 @@ async def md_history(
         step = None
 
     items: list[dict] = []
-    if hasattr(adapter, "get_bars_history"):
-        try:
-            raw = await adapter.get_bars_history(
-                symbol=symbol,
-                tf=str(tf_okx),
-                from_ts=int(from_ or 0),
-            )
-            for b in (raw or []):
-                ts_ms = int(b.get("ts", 0) or 0)
-                t_sec = int(ts_ms / 1000) if ts_ms else 0
-                if t_sec and int(to) and t_sec > int(to):
-                    continue
+    try:
+        raw = await adapter.get_bars_history(
+            symbol=symbol,
+            tf=str(tf_okx),
+            from_ts=int(from_ or 0),
+        )
+        for b in (raw or []):
+            ts_ms = int(b.get("ts", 0) or 0)
+            t_sec = int(ts_ms / 1000) if ts_ms else 0
+            if t_sec and int(to) and t_sec > int(to):
+                continue
 
-                v = b.get("volume", 0)
+            v = b.get("volume", 0)
 
-                items.append({
-                    "time": t_sec,
-                    "close": b.get("close", 0),
-                    "open": b.get("open", 0),
-                    "high": b.get("high", 0),
-                    "low": b.get("low", 0),
-                    "volume": v,
-                })
-        except Exception:
-            items = []
+            items.append({
+                "time": t_sec,
+                "close": b.get("close", 0),
+                "open": b.get("open", 0),
+                "high": b.get("high", 0),
+                "low": b.get("low", 0),
+                "volume": v,
+            })
+    except Exception:
+        items = []
 
     try:
         cb = int(countBack or 0)
@@ -1585,158 +1513,6 @@ async def md_securities_root(
 @app.get("/md/v2/time")
 def md_time():
     return int(time.time())
-
-@app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/market")
-async def cmd_market_order(
-    request: Request,
-    x_reqid: str = Header(..., alias="X-REQID"),
-):
-    body = await request.json()
-
-    if x_reqid in _ORDER_IDEMPOTENCY:
-        old_body = _ORDER_IDEMPOTENCY[x_reqid]
-        return JSONResponse(
-            {
-                "message": "Request with such X-REQID was already handled.",
-                "oldResponse": {
-                    "statusCode": 200,
-                    "body": old_body
-                }
-            },
-            status_code=400
-        )
-
-    side = (body.get("side") or "").lower()
-    qty = body.get("quantity")
-    instr = body.get("instrument") or {}
-
-    symbol = instr.get("symbol")
-    inst_type = instr.get("instrumentGroup") or instr.get("board")
-
-    if side not in ("buy", "sell"):
-        raise HTTPException(status_code=400, detail="Invalid side")
-    if symbol is None or str(symbol).strip() == "":
-        raise HTTPException(status_code=400, detail="Instrument symbol is required")
-    if qty is None:
-        raise HTTPException(status_code=400, detail="quantity is required")
-    try:
-        qty_f = float(qty)
-    except Exception:
-        raise HTTPException(status_code=400, detail="quantity must be number")
-    if inst_type is None or str(inst_type).strip() == "":
-        raise HTTPException(status_code=400, detail="instrumentGroup/board is required")
-    inst_type_s = str(inst_type).strip().upper()
-    if inst_type_s not in ("SPOT", "FUTURES", "SWAP"):
-        raise HTTPException(status_code=400, detail="Unsupported instrumentGroup/board")
-    tgt_ccy = None
-    if inst_type_s == "SPOT" and side == "buy": # SPOT: размер в базовой валюте (для BUY нужно tgtCcy="base_ccy")
-        tgt_ccy = "base_ccy"
-
-    try:
-        res = await adapter.place_market_order(
-            symbol=symbol,
-            side=side,
-            quantity=qty_f,
-            inst_type=inst_type_s,
-            tgt_ccy=tgt_ccy,
-            cl_ord_id=x_reqid,
-        )
-    except Exception as e:
-        return JSONResponse({"message": str(e)}, status_code=502)
-
-    out = {
-        "message": "success",
-        "orderNumber": str(res.get("ordId") or "0"),
-    }
-
-    _ORDER_IDEMPOTENCY[x_reqid] = out
-    return JSONResponse(out)
-
-@app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/limit")
-async def cmd_limit_order(
-    request: Request,
-    x_reqid: str = Header(..., alias="X-REQID"),
-):
-    body = await request.json()
-
-    if x_reqid in _ORDER_IDEMPOTENCY_LIMIT:
-        old_body = _ORDER_IDEMPOTENCY_LIMIT[x_reqid]
-        return JSONResponse(
-            {
-                "message": "Request with such X-REQID was already handled.",
-                "oldResponse": {
-                    "statusCode": 200,
-                    "body": old_body
-                }
-            },
-            status_code=400
-        )
-
-    side = (body.get("side") or "").lower()
-    qty = body.get("quantity")
-    price = body.get("price")
-    instr = body.get("instrument") or {}
-
-    symbol = instr.get("symbol")
-    inst_type = instr.get("instrumentGroup") or instr.get("board")
-
-    # валидация (по аналогии с market, но +price)
-    if side not in ("buy", "sell"):
-        raise HTTPException(status_code=400, detail="Invalid side. Allowed values: buy, sell")
-    if symbol is None or str(symbol).strip() == "":
-        raise HTTPException(status_code=400, detail="Instrument symbol is required")
-    if qty is None:
-        raise HTTPException(status_code=400, detail="quantity is required")
-    if price is None:
-        raise HTTPException(status_code=400, detail="price is required")
-    try:
-        qty_f = float(qty)
-    except Exception:
-        raise HTTPException(status_code=400, detail="quantity must be number")
-    try:
-        price_f = float(price)
-    except Exception:
-        raise HTTPException(status_code=400, detail="price must be number")
-    if inst_type is None or str(inst_type).strip() == "":
-        raise HTTPException(status_code=400, detail="instrumentGroup/board is required")
-    inst_type_s = str(inst_type).strip().upper()
-    if inst_type_s not in ("SPOT", "FUTURES", "SWAP"):
-        raise HTTPException(status_code=400, detail="Unsupported instrumentGroup/board")   
-    
-    tif = (body.get("timeInForce") or "oneday").lower()
-    if tif in ("oneday", "goodtillcancelled"):
-        okx_ord_type = "limit"
-    elif tif == "immediateorcancel":
-        okx_ord_type = "ioc"
-    elif tif == "fillorkill":
-        okx_ord_type = "fok"
-    elif tif == "bookorcancel":
-        okx_ord_type = "post_only"
-    elif tif == "attheclose":
-        raise HTTPException(status_code=400, detail="timeInForce attheclose is not supported for OKX")
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported timeInForce: {tif}")
-
-    try:
-        res = await adapter.place_limit_order(
-            symbol=symbol,
-            side=side,
-            quantity=qty_f,
-            price=price_f,
-            inst_type=inst_type_s,
-            ord_type=okx_ord_type,
-            cl_ord_id=x_reqid,  # как и в market
-        )
-    except Exception as e:
-        return JSONResponse({"message": str(e)}, status_code=502)
-
-    out = {
-        "message": "success",
-        "orderNumber": str(res.get("ordId") or "0"),
-    }
-
-    _ORDER_IDEMPOTENCY_LIMIT[x_reqid] = out
-    return JSONResponse(out)
 
 @app.post("/commandapi/warptrans/FX1/v2/client/orders/estimate") 
 @app.post("/commandapi/warptrans/TRADE/v2/client/orders/estimate")
@@ -1953,96 +1729,6 @@ async def cmd_orders_clients_risk(
     }
     return JSONResponse(out)
 
-@app.post("/commandapi/warptrans/TRADE/v2/client/orders/actions/stop")
-async def create_stop_order(request: Request):
-
-    body = await request.json()
-    x_reqid = request.headers.get("X-REQID")
-    if not x_reqid:
-        raise HTTPException(status_code=400, detail="X-REQID header is required")
-    if x_reqid in _ORDER_IDEMPOTENCY_STOP:
-        old_body = _ORDER_IDEMPOTENCY_STOP[x_reqid]
-        return JSONResponse(
-            {
-                "message": "Request with such X-REQID was already handled.",
-                "oldResponse": {
-                    "statusCode": 200,
-                    "body": old_body
-                }
-            },
-            status_code=400
-        )
-
-    side = body.get("side")
-    condition = body.get("condition")
-    trigger_price = body.get("triggerPrice")
-    qty = body.get("quantity")
-    instrument = body.get("instrument") or {}
-    allow_margin = bool(body.get("allowMargin", False))
-
-    symbol = instrument.get("symbol")
-    inst_type = instrument.get("instrumentGroup") or instrument.get("board")
-    inst_type_s = str(inst_type).strip().upper()
-
-    if side not in ("buy", "sell"):
-        raise HTTPException(status_code=400, detail="Invalid side")
-    if not symbol:
-        raise HTTPException(status_code=400, detail="Instrument symbol is required")
-    
-    if trigger_price is None:
-        raise HTTPException(status_code=400, detail="triggerPrice is required")
-    try:
-        trigger_price_f = float(trigger_price)
-    except Exception:
-        raise HTTPException(status_code=400, detail="triggerPrice must be number")
-    if trigger_price_f <= 0:
-        raise HTTPException(status_code=400, detail="triggerPrice must be > 0")
-    
-    if qty is None:
-        raise HTTPException(status_code=400, detail="quantity is required")
-    try:
-        qty_f = float(qty)
-    except Exception:
-        raise HTTPException(status_code=400, detail="quantity must be number")
-    if qty_f <= 0:
-        raise HTTPException(status_code=400, detail="quantity must be > 0")
-    if inst_type_s not in ("SPOT", "FUTURES", "SWAP"):
-            raise HTTPException(status_code=400, detail="Unsupported instrumentGroup/boar")
-
-    allowed = ("more", "less", "moreorequal", "lessorequal")
-    if condition not in allowed:
-        raise HTTPException(status_code=400, detail=f"Invalid condition. Allowed values: {', '.join(allowed)}")
-    if side == "buy" and condition not in ("more", "moreorequal"):
-        raise HTTPException(status_code=400, detail="For side=buy condition must be more/moreorequal")
-    if side == "sell" and condition not in ("less", "lessorequal"):
-        raise HTTPException(status_code=400, detail="For side=sell condition must be less/lessorequal")
-
-    td_mode = "cross" if allow_margin else "cash"
-
-    # OKX не различает more / >= и less / <=
-    trigger_px_type = "last"
-
-    try:
-        res = await adapter.place_stop_market_order(
-            inst_id=symbol,
-            inst_type=inst_type_s,
-            side=side,
-            sz=str(qty),
-            trigger_px=str(trigger_price),
-            trigger_px_type=trigger_px_type,
-            td_mode=td_mode,
-            algo_cl_ord_id=x_reqid,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    out = {
-        "message": "success",
-        "orderNumber": res.get("algoId") or res.get("orderId"),
-    }
-    _ORDER_IDEMPOTENCY_STOP[x_reqid] = out
-    return out
-
 @app.websocket("/ws")
 async def ws_stream(ws: WebSocket):
     try:
@@ -2058,13 +1744,7 @@ async def ws_stream(ws: WebSocket):
         except Exception:
             return
 
-    """await safe_send_json({
-        "message": "Connected",
-        "httpCode": 200,
-    })"""
-
     active: dict[str, list[asyncio.Event]] = {
-        "instruments": [],   # пока не используются в opcode
         "quotes": [],
         "book": [],
         "fills": [],
@@ -2079,10 +1759,6 @@ async def ws_stream(ws: WebSocket):
     # throttling per subscription guid (frequency in ms)
     last_sent_ms_book: dict[str, int] = {}
     last_sent_ms_quotes: dict[str, int] = {}
-
-    async def send_wrapped(name: str, payload, guid: str | None = None):
-        data = payload.dict() if hasattr(payload, "dict") else payload
-        await safe_send_json({"data": data, "guid": guid or f"{name}:req"})
     
     #сообщение об успешной подписке. код 200
     async def send_ack_200(guid: str | None):
@@ -2356,7 +2032,7 @@ async def ws_stream(ws: WebSocket):
                     await send_ack_200(sub_guid)
 
                     # история
-                    if (not skip_history) and hasattr(adapter, "get_bars_history"):
+                    if not skip_history:
                         try:
                             history = await adapter.get_bars_history(
                                 symbol=code,
@@ -2493,7 +2169,7 @@ async def ws_stream(ws: WebSocket):
                 await send_ack_200(sub_guid)
 
                 # REST history: orders-history (SPOT + FUTURES + SWAP)
-                if not skip_history and hasattr(adapter, "get_orders_history"):
+                if not skip_history:
                     try:
                         if not inst_type_rest:
                             inst_types = ["SPOT", "FUTURES", "SWAP", "MARGIN"]
@@ -2512,7 +2188,7 @@ async def ws_stream(ws: WebSocket):
                         pass
 
                 # история заявок (pending) через REST
-                if (not skip_history) and hasattr(adapter, "get_orders_pending"):
+                if not skip_history:
                     try:
                         if not inst_type_rest:
                             inst_types = ["SPOT", "FUTURES", "SWAP", "MARGIN"]
@@ -2583,39 +2259,20 @@ async def ws_stream(ws: WebSocket):
                 async def on_book(book: dict, _guid: str):
                     now_ms = int(time.time() * 1000)
                     freq_ms = frequency if isinstance(frequency, int) else 25
-
                     prev_ms = last_sent_ms_book.get(_guid, 0)
                     if freq_ms > 0 and (now_ms - prev_ms) < freq_ms:
                         return
 
                     last_sent_ms_book[_guid] = now_ms
-
-                    """" 
-                    book (нейтральный формат от адаптера):
-                    {
-                       "symbol": "...",
-                       "ts": <ms>,
-                       "bids": [(price, volume), ...],
-                       "asks": [(price, volume), ...],
-                       "existing": True|False
-                    }
-                    """
                     ms_ts = int(book.get("ts", 0) or 0)
                     ts_sec = int(ms_ts / 1000) if ms_ts else 0
-
                     existing_flag = bool(book.get("existing", False))
-
                     bids_in = book.get("bids") or []
                     asks_in = book.get("asks") or []
 
-                    # применяем глубину на стороне
                     if depth and depth > 0:
                         bids_in = bids_in[:depth]
                         asks_in = asks_in[:depth]
-
-                    bids = [{"price": p, "volume": v} for (p, v) in bids_in]
-                    asks = [{"price": p, "volume": v} for (p, v) in asks_in]
-
                     if data_format_norm == "slim":
                         payload = {
                             "b": [{"p": float(p), "v": float(v)} for (p, v) in bids_in],
@@ -2623,7 +2280,6 @@ async def ws_stream(ws: WebSocket):
                             "t": ms_ts,
                             "h": bool(existing_flag),
                         }
-
                     elif data_format_norm == "simple":
                         payload = {
                             "snapshot": existing_flag,
@@ -2633,9 +2289,7 @@ async def ws_stream(ws: WebSocket):
                             "ms_timestamp": ms_ts,
                             "existing": existing_flag,
                         }
-
                     await safe_send_json({"data": payload, "guid": _guid})
-
                 if code:
                     # Сначала запускается подписка и ждём подтверждение/ошибку от OKX
                     subscribed_evt = asyncio.Event()
@@ -2937,7 +2591,7 @@ async def ws_stream(ws: WebSocket):
                 await send_ack_200(sub_guid)
 
                 # история сделок (REST)
-                if (not skip_history) and hasattr(adapter, "get_trades_history"):
+                if not skip_history:
                     try:
                         history = await adapter.get_trades_history(inst_type=inst_type_rest, limit=100)
                         for tr in history:
@@ -2962,6 +2616,7 @@ async def ws_stream(ws: WebSocket):
                 #exchange_out = "OKX"
                 exchange_out = "OKX"
                 portfolio = msg.get("portfolio")
+                portfolio_out = portfolio or "DEV_portfolio"
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
                 inst_type = msg.get("instrumentGroup") or msg.get("board")
@@ -2987,7 +2642,7 @@ async def ws_stream(ws: WebSocket):
                         "currentVolume": current_volume,
                         "symbol": symbol,
                         "brokerSymbol": f"{exchange_out}:{symbol}",
-                        "portfolio": "DEV_portfolio",
+                        "portfolio": portfolio_out,
                         "exchange": exchange_out,
                         "avgPrice": avg_price,
                         "qtyUnits": qty_units,
@@ -3189,7 +2844,6 @@ async def ws_stream(ws: WebSocket):
                 pass
         subs.clear()
 
-
 @app.websocket("/cws")
 async def cws_stream(ws: WebSocket):
     try:
@@ -3340,7 +2994,6 @@ async def cws_stream(ws: WebSocket):
                     or msg.get("board")
                 )
                 allow_margin = bool(msg.get("allowMargin", False))
-                #allow_margin = False
                 inst_type_s = str(inst_type).strip().upper() if inst_type is not None else ""
                 ccy = await _resolve_order_ccy(symbol, inst_type_s, side, allow_margin)
 
