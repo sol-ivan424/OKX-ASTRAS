@@ -59,3 +59,15 @@ Thumbs.db
 *.bak
 *.old
 *.orig
+
+# -----------------------------
+# Локальные/архивные файлы проекта (не синхронизируем в GitHub)
+# -----------------------------
+OKX API doc.pdf
+check_okx_keys.py
+comments.txt
+tests/
+договоры/
+api/server_old.py
+adapters/mock_adapter.py
+adapters/неактуальное/
