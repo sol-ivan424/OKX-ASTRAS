@@ -82,9 +82,6 @@ class OkxAdapter:
             self._ws_public_url = "wss://ws.okx.com:8443/ws/v5/public"
             self._ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
 
-        # ВАЖНО:
-        # Приватные каналы OKX (orders / fills / account) работают ТОЛЬКО через ws/v5/private
-        # Если подписаться на них через public или business — OKX вернёт 60018 (Wrong URL or channel).
         self._ws_private_channels = {"orders", "fills", "account", "positions"}
 
     def _assert_private_ws(self, channel: str, ws_url: str) -> None:
@@ -140,13 +137,6 @@ class OkxAdapter:
             )
         return self._http_client
 
-    #корректное закрытие HTTP-клиента
-    async def close(self) -> None:
-        if self._http_client is not None:
-            await self._http_client.aclose()
-            self._http_client = None
-        await self._close_order_ws()
-
     #нормализация пути к /api/v5/...
     def _normalize_path(self, path: str) -> str:
         if not path.startswith("/"):
@@ -169,7 +159,7 @@ class OkxAdapter:
     def _base_headers(self) -> Dict[str, str]:
         """
         Базовые заголовки.
-        Для demo OKX нужен заголовок x-simulated-trading: 1 (если используешь demo).
+        Для demo OKX нужен заголовок x-simulated-trading: 1
         """
         headers: Dict[str, str] = {}
         if self._demo:
@@ -261,16 +251,8 @@ class OkxAdapter:
             raise RuntimeError(f"OKX error {data.get('code')}: {data.get('msg')}")
         return data
 
-    #проверка валидности API-ключей
-    async def check_api_keys(self) -> None:
-        await self._request_private("GET", "/account/balance")
-
     #получение списка инструментов OKX
     async def list_instruments(self, inst_type: str = "SPOT") -> List[dict]:
-        """
-        Возвращает инструменты OKX в нейтральном формате:
-        symbol, exchange, instType, state, baseCcy, quoteCcy, lotSz, tickSz
-        """
         raw = await self._request_public(
             path="/public/instruments",
             params={"instType": inst_type},
@@ -992,10 +974,6 @@ class OkxAdapter:
         is_history: bool,
         inst_type: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Нейтральный формат сделки (исполнения):
-        id, orderno, comment, symbol, side, price, qty_units, qty, ts(ms), commission, fee_ccy, is_history
-        """
 
         trade_id = d.get("tradeId") or d.get("billId") or "0"
         ord_id = d.get("ordId") or "0"
@@ -1015,18 +993,12 @@ class OkxAdapter:
             # fallback: uTime/cTime, если fillTime/ts нет
             ts_ms = self._to_int(d.get("uTime") if d.get("uTime") is not None else d.get("cTime"))
 
-        # комиссия
         fee = d.get("fee")
         commission = abs(self._to_float(fee)) if fee is not None else 0.0
         fee_ccy = d.get("feeCcy") or "0"
-
-        # стоимость сделки в валюте расчёта (для OKX SPOT это quote)
         value = fill_px * fill_sz
         volume = value
-
-        # exchange/instType полезны для маппинга в Astras (board/instrumentGroup)
         inst_type_s = str(inst_type or d.get("instType") or "").upper() or None
-
         # date в ISO 8601 UTC (как ждёт Astras): 2023-12-29T12:35:06.0000000Z
         date_iso = None
         if ts_ms and ts_ms > 0:
@@ -1109,20 +1081,6 @@ class OkxAdapter:
         state: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        """
-        Возвращает историю заявок в нейтральном формате (как _parse_okx_order_any).
-
-        OKX endpoint: /trade/orders-history
-
-        Важно:
-        - В запросе Astras на историю заявок instType может отсутствовать.
-          Если inst_type=None — считаем, что нужно взять историю по всему аккаунту,
-          и делаем запросы для SPOT + SWAP + FUTURES, объединяя результат.
-
-        Параметры:
-        - inst_id / ord_type / state — опциональные фильтры OKX.
-        - limit — ограничение на ответ OKX (обычно до 100).
-        """
 
         def _norm_inst_type(x: Optional[str]) -> Optional[str]:
             if x is None:
@@ -1162,97 +1120,6 @@ class OkxAdapter:
         # сортируем по времени обновления
         out.sort(key=lambda x: int(x.get("ts_update", 0) or 0))
         return out
-
-    #REST: выставление рыночной заявки (market order)
-    async def place_market_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        inst_type: str = "SPOT",
-        td_mode: Optional[str] = None,
-        pos_side: Optional[str] = None,
-        tgt_ccy: Optional[str] = None,
-        cl_ord_id: Optional[str] = None,
-        ccy: Optional[str] = None,
-        tif: Optional[str] = None 
-    ) -> Dict[str, Any]:
-        """ 
-        Выставляет рыночную заявку через OKX REST: POST /api/v5/trade/order
-
-        Минимально необходимые параметры по документации OKX:
-        - instId, tdMode, side, ordType, sz
-        Дополнительно:
-        - posSide: требуется в long/short режиме (деривативы)
-        - tgtCcy: для SPOT market buy позволяет указать, в какой валюте задан sz (base_ccy/quote_ccy)
-        - clOrdId: клиентский id
-
-        Возвращает нейтральный результат:
-        {
-          "ordId": "...",
-          "clOrdId": "...",
-          "sCode": "0",
-          "sMsg": ""
-        }
-        """
-
-        inst_id = symbol
-        side_s = str(side or "").lower().strip()
-        if side_s not in ("buy", "sell"):
-            raise ValueError("side must be 'buy' or 'sell'")
-
-        def _fmt_sz(x: float) -> str:
-            s = f"{x:.16f}".rstrip("0").rstrip(".")
-            return s if s else "0"
-
-        # tdMode: SPOT без маржи -> cash, деривативы/маржа -> cross/isolated
-        if td_mode is None:
-            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
-
-        body: Dict[str, Any] = {
-            "instId": inst_id,
-            "tdMode": td_mode,
-            "side": side_s,
-            "ordType": "market",
-            "sz": _fmt_sz(quantity),
-        }
-        inst_id_code = await self._resolve_inst_id_code(inst_id, inst_type)
-        if not inst_id_code:
-            raise RuntimeError(
-                f"Cannot resolve instIdCode for instType={str(inst_type or '').upper()} instId={inst_id}"
-            )
-        body["instIdCode"] = inst_id_code
-        if cl_ord_id:
-            body["clOrdId"] = str(cl_ord_id)
-        if pos_side:
-            body["posSide"] = str(pos_side)
-        if tgt_ccy:
-            body["tgtCcy"] = str(tgt_ccy)
-        if ccy:
-            body["ccy"] = str(ccy)
-        if tif:
-            body["tif"] = str(tif)
-
-        raw = await self._request_private("POST", "/trade/order", body=body)
-
-        items = raw.get("data") or []
-        if not items:
-            raise RuntimeError("OKX order: empty response data")
-
-        it0 = items[0] or {}
-        s_code = str(it0.get("sCode") or "")
-        s_msg = str(it0.get("sMsg") or "")
-
-        # OKX: code==0 может быть, но конкретно по ордеру sCode!=0
-        if s_code and s_code != "0":
-            raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
-
-        return {
-            "ordId": str(it0.get("ordId") or "0"),
-            "clOrdId": str(it0.get("clOrdId") or ""),
-            "sCode": s_code or "0",
-            "sMsg": s_msg,
-        }
 
     #WS: выставление рыночной заявки (market order) через private WS op=order
     async def place_market_order_ws(
@@ -1485,203 +1352,6 @@ class OkxAdapter:
         return {
             "ordId": str(it0.get("ordId") or order_id or "0"),
             "clOrdId": str(it0.get("clOrdId") or ""),
-            "sCode": s_code or "0",
-            "sMsg": s_msg,
-        }
-
-    #REST: выставление лимитной заявки (limit order)
-    async def place_limit_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        price: float,
-        inst_type: str = "SPOT",
-        td_mode: Optional[str] = None,
-        pos_side: Optional[str] = None,
-        ord_type: Optional[str] = None,
-        cl_ord_id: Optional[str] = None,
-        ccy: Optional[str] = None,
-        tif: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Выставляет лимитную заявку через OKX REST: POST /api/v5/trade/order
-
-        По документации OKX для лимитной заявки нужны:
-        - instId, tdMode, side, ordType, sz, px
-
-        ordType (OKX):
-        - limit (обычная лимитная)
-        - post_only (пассивная, Maker-only)
-        - ioc (Immediate-or-cancel)
-        - fok (Fill-or-kill)
-
-        Возвращает нейтральный результат:
-        {
-          "ordId": "...",
-          "clOrdId": "...",
-          "sCode": "0",
-          "sMsg": ""
-        }
-        """
-
-        inst_id = symbol
-        side_s = str(side or "").lower().strip()
-        if side_s not in ("buy", "sell"):
-            raise ValueError("side must be 'buy' or 'sell'")
-
-        def _fmt_sz(x: float) -> str:
-            s = f"{x:.16f}".rstrip("0").rstrip(".")
-            return s if s else "0"
-
-        def _fmt_px(x: float) -> str:
-            s = f"{x:.16f}".rstrip("0").rstrip(".")
-            return s if s else "0"
-
-        # tdMode: SPOT без маржи -> cash, деривативы/маржа -> cross/isolated
-        if td_mode is None:
-            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
-
-        # ordType по умолчанию для лимитной заявки
-        ord_type_s = (ord_type or "limit").lower().strip()
-        if ord_type_s not in ("limit", "post_only", "ioc", "fok"):
-            raise ValueError("ord_type must be one of: limit, post_only, ioc, fok")
-
-        body: Dict[str, Any] = {
-            "instId": inst_id,
-            "tdMode": td_mode,
-            "side": side_s,
-            "ordType": ord_type_s,
-            "sz": _fmt_sz(quantity),
-            "px": _fmt_px(price),
-        }
-        if cl_ord_id:
-            body["clOrdId"] = str(cl_ord_id)
-        if pos_side:
-            body["posSide"] = str(pos_side)
-        if ccy:
-            body["ccy"] = str(ccy)
-        if tif:
-            body["tif"] = str(tif)
-
-        raw = await self._request_private("POST", "/trade/order", body=body)
-
-        items = raw.get("data") or []
-        if not items:
-            raise RuntimeError("OKX order: empty response data")
-
-        it0 = items[0] or {}
-        s_code = str(it0.get("sCode") or "")
-        s_msg = str(it0.get("sMsg") or "")
-
-        # OKX: code==0 может быть, но конкретно по ордеру sCode!=0
-        if s_code and s_code != "0":
-            raise RuntimeError(f"OKX order error {s_code}: {s_msg}")
-
-        return {
-            "ordId": str(it0.get("ordId") or "0"),
-            "clOrdId": str(it0.get("clOrdId") or ""),
-            "sCode": s_code or "0",
-            "sMsg": s_msg,
-        }
-
-    #REST: выставление стоп-заявки (conditional / algo order)
-    async def place_stop_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: float,
-        trigger_price: float,
-        inst_type: str = "SPOT",
-        td_mode: Optional[str] = None,
-        pos_side: Optional[str] = None,
-        trigger_px_type: Optional[str] = None,
-        cl_ord_id: Optional[str] = None,
-        ccy: Optional[str] = None,
-        tgt_ccy: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Выставляет стоп-заявку через OKX REST conditional/algo ордер:
-        POST /api/v5/trade/order-algo
-
-        Мы делаем STOP-MARKET (после триггера исполняется по рынку):
-        - ordType = "conditional"
-        - triggerPx = условная цена
-        - triggerPxType = тип цены для сравнения (по умолчанию "last")
-        - orderPx = "-1"  (для market исполнения после триггера)
-
-        Минимально необходимые параметры по документации OKX:
-        - instId, tdMode, side, ordType, sz, triggerPx, triggerPxType, orderPx
-
-        Дополнительно:
-        - posSide: требуется для деривативов в hedge (long/short) режиме
-        - algoClOrdId: клиентский id для algo-ордера (можно использовать X-REQID)
-        - ccy: валюта списания (опционально)
-        - tgtCcy: для SPOT может потребоваться в некоторых режимах (опционально; если OKX не поддержит — вернёт ошибку)
-
-        Возвращает нейтральный результат:
-        {
-          "algoId": "...",
-          "algoClOrdId": "...",
-          "sCode": "0",
-          "sMsg": ""
-        }
-        """
-
-        inst_id = symbol
-        side_s = str(side or "").lower().strip()
-        if side_s not in ("buy", "sell"):
-            raise ValueError("side must be 'buy' or 'sell'")
-
-        def _fmt_num(x: float) -> str:
-            s = f"{x:.16f}".rstrip("0").rstrip(".")
-            return s if s else "0"
-
-        # tdMode: SPOT без маржи -> cash, деривативы/маржа -> cross/isolated
-        if td_mode is None:
-            td_mode = "cash" if str(inst_type).upper() == "SPOT" else "cross"
-
-        # triggerPxType: last / index / mark (по документации OKX)
-        tpx_type = (trigger_px_type or "last").lower().strip()
-        if tpx_type not in ("last", "index", "mark"):
-            raise ValueError("trigger_px_type must be one of: last, index, mark")
-
-        body: Dict[str, Any] = {
-            "instId": inst_id,
-            "tdMode": td_mode,
-            "side": side_s,
-            "ordType": "conditional",
-            "sz": _fmt_num(quantity),
-            "triggerPx": _fmt_num(trigger_price),
-            "triggerPxType": tpx_type,
-            # ordPx = -1 => market order after trigger
-            "orderPx": "-1",
-        }
-        if pos_side:
-            body["posSide"] = str(pos_side)
-        if cl_ord_id:
-            body["algoClOrdId"] = str(cl_ord_id)
-        if ccy:
-            body["ccy"] = str(ccy)
-        if tgt_ccy:
-            body["tgtCcy"] = str(tgt_ccy)
-
-        raw = await self._request_private("POST", "/trade/order-algo", body=body)
-
-        items = raw.get("data") or []
-        if not items:
-            raise RuntimeError("OKX stop/algo order: empty response data")
-
-        it0 = items[0] or {}
-        s_code = str(it0.get("sCode") or "")
-        s_msg = str(it0.get("sMsg") or "")
-
-        if s_code and s_code != "0":
-            raise RuntimeError(f"OKX stop/algo order error {s_code}: {s_msg}")
-
-        return {
-            "algoId": str(it0.get("algoId") or "0"),
-            "algoClOrdId": str(it0.get("algoClOrdId") or ""),
             "sCode": s_code or "0",
             "sMsg": s_msg,
         }
@@ -2264,163 +1934,6 @@ class OkxAdapter:
                     "eq": self._to_float(d.get("eq")),
                 })
         return out
-
-    # REST: позиции по деривативам (SWAP / FUTURES)
-    async def get_positions(self, inst_type: str = "SWAP") -> List[Dict[str, Any]]:
-        """
-        OKX REST /account/positions
-        Используется для SWAP / FUTURES.
-
-        Возвращает нейтральный формат позиции:
-        {
-          instId, instType, pos, avgPx, upl, uplRatio
-        }
-        """
-        raw = await self._request_private(
-            "GET",
-            "/account/positions",
-            params={"instType": inst_type},
-        )
-
-        out: List[Dict[str, Any]] = []
-        for item in raw.get("data", []) or []:
-            out.append({
-                "instId": item.get("instId"),
-                "instType": item.get("instType"),
-                "pos": self._to_float(item.get("pos")),
-                "avgPx": self._to_float(item.get("avgPx")),
-                "upl": self._to_float(item.get("upl")),
-                "uplRatio": self._to_float(item.get("uplRatio")),
-            })
-        return out
-
-    # WS: подписка на позиции и деньги (private)
-    async def subscribe_positions_and_balances(
-        self,
-        on_data: Callable[[Dict[str, Any]], Any],
-        stop_event: asyncio.Event,
-        inst_type: str = "SPOT",
-        on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
-        on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
-        unsub_args: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        """
-        OKX private WS:
-        - channel=account   -> деньги / балансы
-        - channel=positions -> позиции (SWAP/FUTURES)
-
-        SPOT:
-        - используем account
-        SWAP/FUTURES:
-        - используем positions + account
-        """
-
-        login_msg = self._ws_login_payload()
-
-        args: List[Dict[str, Any]] = [{"channel": "account"}]
-
-        inst_type_u = str(inst_type).upper()
-        if inst_type_u in ("SWAP", "FUTURES"):
-            args.append({"channel": "positions", "instType": inst_type_u})
-
-        sub_msg = {"op": "subscribe", "args": args}
-        unsub_args = unsub_args or sub_msg.get("args")
-
-        while not stop_event.is_set():
-            try:
-                async with websockets.connect(
-                    self._ws_private_url, ping_interval=20, ping_timeout=20
-                ) as ws:
-                    await ws.send(json.dumps(login_msg))
-
-                    # ждём login
-                    authed = False
-                    deadline = asyncio.get_event_loop().time() + 5.0
-                    while not authed and not stop_event.is_set():
-                        if asyncio.get_event_loop().time() > deadline:
-                            if on_error:
-                                res = on_error({"event": "error", "msg": "OKX WS login timeout"})
-                                if asyncio.iscoroutine(res):
-                                    await res
-                            return
-
-                        msg = json.loads(await ws.recv())
-                        if msg.get("event") == "login" and msg.get("code") == "0":
-                            authed = True
-                            break
-                        if msg.get("event") == "error":
-                            if on_error:
-                                res = on_error(msg)
-                                if asyncio.iscoroutine(res):
-                                    await res
-                            return
-
-                    await ws.send(json.dumps(sub_msg))
-
-                    # Ждём реальный event: subscribe от OKX, а не шлём "заглушку"
-                    subscribed = False
-                    sub_deadline = asyncio.get_event_loop().time() + 5.0
-                    while not subscribed and not stop_event.is_set():
-                        if asyncio.get_event_loop().time() > sub_deadline:
-                            if on_error:
-                                res = on_error({"event": "error", "msg": "OKX WS subscribe timeout"})
-                                if asyncio.iscoroutine(res):
-                                    await res
-                            return
-
-                        raw = await ws.recv()
-                        msg = json.loads(raw)
-
-                        if msg.get("event") == "error":
-                            if on_error:
-                                res = on_error(msg)
-                                if asyncio.iscoroutine(res):
-                                    await res
-                            return
-
-                        if msg.get("event") == "subscribe":
-                            if on_subscribed:
-                                res = on_subscribed(msg)
-                                if asyncio.iscoroutine(res):
-                                    await res
-                            subscribed = True
-                            break
-
-                        # Если пришли данные раньше subscribe — не теряем: прокидываем в on_data
-                        data = msg.get("data")
-                        if data:
-                            for item in data:
-                                res = on_data(item)
-                                if asyncio.iscoroutine(res):
-                                    await res
-
-                    # основной цикл чтения данных
-                    while not stop_event.is_set():
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            continue
-
-                        msg = json.loads(raw)
-                        data = msg.get("data")
-                        if not data:
-                            continue
-
-                        for item in data:
-                            res = on_data(item)
-                            if asyncio.iscoroutine(res):
-                                await res
-
-                    if stop_event.is_set() and subscribed:
-                        await self._ws_unsubscribe(ws, unsub_args)
-
-            except Exception as e:
-                if on_error:
-                    res = on_error({"event": "error", "msg": str(e)})
-                    if asyncio.iscoroutine(res):
-                        await res
-                await asyncio.sleep(1.0)
-                return
 
     def _parse_okx_account_balance_any(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
         """OKX private WS/REST `account` channel/balance endpoint -> currency positions."""

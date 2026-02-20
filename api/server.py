@@ -588,436 +588,6 @@ def all_portfolios(user_id: str):
         }
     ])
 
-@app.post("/hyperion")
-async def hyperion(request: Request):
-    """
-    GraphQL endpoint для Astras (виджет «Все инструменты»).
-    """
-    body = await request.json()
-    variables = body.get("variables", {}) or {}
-    where = variables.get("where") or {}
-
-    query_str = body.get("query") or ""
-    # Если Astras запрашивает instrument(...) — нужно вернуть data.instrument
-    want_single_instrument = ("instrument(" in query_str) and ("instruments" not in query_str)
-
-    first = variables.get("first", 20)
-    try:
-        first = int(first)
-    except Exception:
-        first = 20
-    first = max(1, min(first, 500))
-
-    after = variables.get("after")
-
-    await _ensure_instr_cache()
-    # Всегда свежие котировки для Hyperion:
-    # В таблице «Все инструменты» одновременно есть SPOT/FUTURES/SWAP,
-    # поэтому собираем tickers сразу для всех типов и объединяем по symbol.
-    async def _load_ticker_map() -> dict:
-        inst_types = ("SPOT", "FUTURES", "SWAP")
-
-        results = await asyncio.gather(
-            *(adapter.list_tickers(inst_type=it) for it in inst_types),
-            return_exceptions=True,
-        )
-
-        merged: list[dict] = []
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            if r:
-                merged.extend(r)
-
-        return {t.get("symbol"): t for t in merged if t.get("symbol")}
-
-    ticker_map = await _load_ticker_map()
-
-
-    items = list(_INSTR_CACHE.values())
-
-    # --- универсальный поиск (where.and[]) ---
-    and_filters = (where.get("and") or [])
-
-    def _match(item: dict, cond: dict) -> bool:
-        # --- basicInformation ---
-        bi = cond.get("basicInformation")
-        if bi:
-            if "symbol" in bi and "contains" in bi["symbol"]:
-                if bi["symbol"]["contains"].upper() not in (item.get("symbol") or "").upper():
-                    return False
-
-            if "shortName" in bi and "contains" in bi["shortName"]:
-                if bi["shortName"]["contains"].upper() not in (item.get("symbol") or "").upper():
-                    return False
-
-        # --- currencyInformation ---
-        ci = cond.get("currencyInformation")
-        if ci:
-            if "nominal" in ci and "contains" in ci["nominal"]:
-                if ci["nominal"]["contains"].upper() not in (item.get("quoteCcy") or "").upper():
-                    return False
-
-
-        # --- tradingDetails (ФИЛЬТРУЕМ ПО TICKERS) ---
-        td = cond.get("tradingDetails")
-        if td:
-            symbol = item.get("symbol")
-            t = ticker_map.get(symbol)
-
-            # если нет тикера — фильтр не проходит
-            if not t:
-                return False
-
-            # вычисляем значения так же, как в _make_node
-            last = t.get("last")
-            open24h = t.get("open24h")
-            high24h = t.get("high24h")
-            low24h = t.get("low24h")
-            vol24h = t.get("vol24h")
-
-            if open24h is not None and open24h != 0 and last is not None:
-                daily_growth = last - open24h
-                daily_growth_percent = (daily_growth / open24h) * 100.0
-            else:
-                daily_growth = None
-                daily_growth_percent = None
-
-            field_map = {
-                "price": last,
-                "priceMax": high24h,
-                "priceMin": low24h,
-                "dailyGrowth": daily_growth,
-                "dailyGrowthPercent": daily_growth_percent,
-                "tradeVolume": vol24h,
-                "tradeAmount": (vol24h * last) if (vol24h is not None and last is not None) else None,
-            }
-
-            for field, rules in td.items():
-                value = field_map.get(field)
-
-                if value is None:
-                    return False
-
-                if "gte" in rules and value < rules["gte"]:
-                    return False
-
-                if "lte" in rules and value > rules["lte"]:
-                    return False
-
-        return True
-
-    if and_filters:
-        filtered = []
-        for item in items:
-            if all(_match(item, f) for f in and_filters):
-                filtered.append(item)
-        items = filtered
-
-    total_count = len(items)
-
-
-    # --- сортировка (Astras передаёт variables.order) ---
-    order_spec = variables.get("order") or []
-
-    # Предварительно считаем "значения сортировки" 1 раз на инструмент (оптимизация)
-    sort_cache: dict[str, dict] = {}
-
-    def _get_sort_vals(item: dict) -> dict:
-        sym = item.get("symbol") or ""
-        cached = sort_cache.get(sym)
-        if cached is not None:
-            return cached
-
-        t = ticker_map.get(sym, {})  # котировки строго из REST tickers
-        last = t.get("last")
-        open24h = t.get("open24h")
-        high24h = t.get("high24h")
-        low24h = t.get("low24h")
-        vol24h = t.get("vol24h")
-
-        if open24h not in (None, 0) and last is not None:
-            daily_growth = last - open24h
-            daily_growth_percent = (daily_growth / open24h) * 100.0
-        else:
-            daily_growth = None
-            daily_growth_percent = None
-
-        inst_type = item.get("instType")
-        tick_sz = item.get("tickSz")
-        lot_sz = item.get("lotSz")
-        quote_ccy = item.get("quoteCcy")
-
-        cached = {
-            # basicInformation
-            "symbol": sym,
-            "shortName": sym,
-            "market": inst_type,            # basicInformation.market
-
-            # currencyInformation
-            "nominal": quote_ccy,           # currencyInformation.nominal
-
-            # boardInformation
-            "board": inst_type,             # boardInformation.board
-
-            # tradingDetails (из instruments)
-            "minStep": tick_sz,
-            "priceStep": tick_sz,
-            "lotSize": lot_sz,
-
-            # tradingDetails (из tickers)
-            "price": last,
-            "priceMax": high24h,
-            "priceMin": low24h,
-            "dailyGrowth": daily_growth,
-            "dailyGrowthPercent": daily_growth_percent,
-            "tradeVolume": vol24h,
-            "tradeAmount": (vol24h * last) if (vol24h is not None and last is not None) else None,
-        }
-
-        sort_cache[sym] = cached
-        return cached
-
-    def _apply_sort(field: str, direction: str):
-        rev = (direction == "DESC")
-        # None всегда уходит вниз (и при ASC, и при DESC)
-        items.sort(
-            key=lambda x: (
-                _get_sort_vals(x).get(field) is None,
-                _get_sort_vals(x).get(field),
-            ),
-            reverse=rev,
-        )
-
-    # В Astras может быть несколько сортировок: применяем стабильной сортировкой
-    # Сначала второстепенные, потом главные (поэтому reverse)
-    for o in reversed(order_spec):
-        o = o or {}
-
-        # basicInformation: symbol / shortName / market
-        bi = o.get("basicInformation") or {}
-        for field, direction in bi.items():
-            if direction in ("ASC", "DESC") and field in ("symbol", "shortName", "market"):
-                _apply_sort(field, direction)
-
-        # currencyInformation: nominal
-        ci = o.get("currencyInformation") or {}
-        for field, direction in ci.items():
-            if direction in ("ASC", "DESC") and field in ("nominal",):
-                _apply_sort(field, direction)
-
-        # boardInformation: board
-        bo = o.get("boardInformation") or {}
-        for field, direction in bo.items():
-            if direction in ("ASC", "DESC") and field in ("board",):
-                _apply_sort(field, direction)
-
-        # tradingDetails: price/priceMax/priceMin/minStep/priceStep/dailyGrowth/...
-        td = o.get("tradingDetails") or {}
-        for field, direction in td.items():
-            if direction in ("ASC", "DESC") and field in (
-                "price",
-                "priceMax",
-                "priceMin",
-                "minStep",
-                "priceStep",
-                "dailyGrowth",
-                "dailyGrowthPercent",
-                "tradeVolume",
-                "tradeAmount",
-                "lotSize",
-            ):
-                _apply_sort(field, direction)
-
-    # --- пагинация по after (cursor = индекс) ---
-    start_idx = 0
-    if after:
-        try:
-            start_idx = int(after)
-        except Exception:
-            start_idx = 0
-    start_idx = max(0, min(start_idx, total_count))
-
-    sliced = items[start_idx:start_idx + first]
-    end_idx = start_idx + len(sliced)
-
-    has_next = end_idx < total_count
-    has_prev = start_idx > 0
-
-    start_cursor = str(start_idx) if total_count > 0 else None
-    end_cursor = str(end_idx) if total_count > 0 else None
-
-    def _make_node(raw: dict) -> dict:
-        symbol = raw.get("symbol")
-        inst_type = raw.get("instType")
-        quote_ccy = raw.get("quoteCcy")
-
-        # Котировки строго по symbol из REST tickers (okx_adapter.list_tickers)
-        t = ticker_map.get(symbol, {})
-
-        last = t.get("last")
-        open24h = t.get("open24h")
-        high24h = t.get("high24h")
-        low24h = t.get("low24h")
-        vol24h = t.get("vol24h")
-        
-
-        # Рост за день считаем от open24h (цена 24 часа назад)
-        if open24h is not None and open24h != 0 and last is not None:
-            daily_growth = last - open24h
-            daily_growth_percent = (daily_growth / open24h) * 100.0
-        else:
-            daily_growth = None
-            daily_growth_percent = None
-
-
-        return {
-            "__typename": "InstrumentModel",
-
-            # Нужные Astras поля (даже если в списке не запрашиваются)
-            "additionalInformation": {
-                "__typename": "InstrumentAdditionalInformation",
-                "cancellation": raw.get("cancellation"),
-                "complexProductCategory": raw.get("complexProductCategory"),
-                "priceMultiplier": raw.get("priceMultiplier"),
-                "priceShownUnits": raw.get("priceShownUnits"),
-            },
-
-            "basicInformation": {
-                "__typename": "InstrumentBasicInformation",
-
-                # ключевые поля
-                "symbol": symbol,
-                "exchange": "OKX",
-                "shortName": symbol,
-                "market": inst_type,
-                "gicsSector": None,
-
-                # Astras может запрашивать расширенные поля — отдаём что можем, остальное null
-                "type": raw.get("type"),
-                "complexProductCategory": raw.get("complexProductCategory"),
-                "description": raw.get("description"),
-                "fullDescription": raw.get("fullDescription"),
-                "fullName": raw.get("fullName"),
-                "readableType": raw.get("readableType"),
-                "sector": raw.get("sector"),
-            },
-
-            "boardInformation": {
-                "__typename": "InstrumentBoardInformation",
-                "board": inst_type,
-                "isPrimaryBoard": True,
-                "primaryBoard": inst_type,
-            },
-
-            "currencyInformation": {
-                "__typename": "InstrumentCurrencyInformation",
-                "nominal": quote_ccy,
-                # settlement в крипте по смыслу совпадает с валютой котирования
-                "settlement": quote_ccy,
-            },
-
-            "tradingDetails": {
-                "__typename": "InstrumentTradingDetails",
-
-                # шаги/лотность — из instruments
-                "minStep": raw.get("tickSz"),
-                "priceStep": raw.get("tickSz"),
-                "lotSize": raw.get("lotSz"),
-
-                # котировки — из REST tickers (строго по symbol)
-                "price": last if last is not None else None,
-                "priceMax": high24h if high24h is not None else None,
-                "priceMin": low24h if low24h is not None else None,
-
-                # рост за день
-                "dailyGrowth": daily_growth,
-                "dailyGrowthPercent": daily_growth_percent,
-
-                # объёмы (24h, базовая валюта)
-                "tradeVolume": vol24h,
-                "tradeAmount": (vol24h * last) if (vol24h is not None and last is not None) else None,
-
-                # остальное Astras допускает как null
-                "capitalization": None,
-                "closingPrice": last if last is not None else None,
-                "rating": None,
-            },
-
-            "financialAttributes": {
-                "__typename": "InstrumentFinancialAttributes",
-                "cfiCode": raw.get("cfiCode"),
-                "currency": quote_ccy,
-                "isin": raw.get("ISIN"),
-                "tradingStatus": raw.get("tradingStatus"),
-                "tradingStatusInfo": raw.get("state"),
-            },
-        }
-
-    # --- SINGLE instrument (GraphQL instrument(...)) ---
-    if want_single_instrument:
-        sym = variables.get("symbol")
-        await _ensure_instr_cache()
-
-        board_req = variables.get("board")
-        board_req = (str(board_req).strip().upper() if board_req is not None else "")
-
-        raw = _INSTR_CACHE.get(sym) if sym else None
-
-        if sym and board_req:
-            for it in _INSTR_CACHE.values():
-                if it.get("symbol") == sym and (it.get("instType") or "").upper() == board_req:
-                    raw = it
-                    break
-
-        if raw is None:
-            return JSONResponse(
-                {
-                    "requestGuid": "",
-                    "httpCode": 404,
-                    "message": f"Instrument '{sym}' not found on OKX",
-                },
-                status_code=404,
-            )
-
-        node = _make_node(raw)
-
-        return JSONResponse({
-            "data": {
-                "instrument": node
-            }
-        })
-    
-    nodes = [_make_node(x) for x in sliced]
-
-    edges = []
-    for i, n in enumerate(nodes):
-        edges.append({
-            "__typename": "InstrumentModelEdge",
-            "cursor": str(start_idx + i + 1),
-            "node": n,
-        })
-
-    page_info = {
-        "__typename": "PageInfo",
-        "startCursor": start_cursor,
-        "endCursor": end_cursor,
-        "hasNextPage": has_next,
-        "hasPreviousPage": has_prev,
-    }
-
-    return JSONResponse({
-        "data": {
-            "instruments": {
-                "__typename": "InstrumentModelConnection",
-                "nodes": nodes,
-                "totalCount": total_count,
-                "edges": edges,
-                "pageInfo": page_info,
-            }
-        }
-    })
-
 def _astras_instrument_simple(d: dict) -> dict:
     return {
         "symbol": d.get("symbol"),
@@ -1168,9 +738,6 @@ _INSTR_CACHE_TS: float = 0.0 # Чтобы не дергать OKX на кажд�
 _INSTR_LOCK = asyncio.Lock()
 _INSTR_TTL_SEC = 60.0 # TTL кешей (сек)
 SUPPORTED_BOARDS = ["SPOT", "FUTURES", "SWAP"]
-_ORDER_IDEMPOTENCY: dict[str, dict] = {} # cache for market orders: X-REQID -> response json
-_ORDER_IDEMPOTENCY_LIMIT: dict[str, dict] = {} # limit
-_ORDER_IDEMPOTENCY_STOP: dict[str, dict] = {} # stop
 _CWS_MARKET_IDEMPOTENCY: dict[str, dict] = {} # create:market (CWS): guid -> response json
 _CWS_LIMIT_IDEMPOTENCY: dict[str, dict] = {} # create:limit (CWS): guid -> response json
 _CWS_DELETE_MARKET_IDEMPOTENCY: dict[str, dict] = {} # delete:market (CWS): guid -> response json
@@ -1754,9 +1321,7 @@ async def ws_stream(ws: WebSocket):
         "bars": [],
     }
     
-    # guid -> stop_event (чтобы уметь корректно отписываться)
     subs: dict[str, asyncio.Event] = {}
-    # throttling per subscription guid (frequency in ms)
     last_sent_ms_book: dict[str, int] = {}
     last_sent_ms_quotes: dict[str, int] = {}
     
@@ -1855,7 +1420,6 @@ async def ws_stream(ws: WebSocket):
             token = msg.get("token")
             symbols: List[str] = msg.get("symbols", [])
             req_guid = msg.get("guid")
-            # inst_type может приходить как instrumentGroup или как board
             inst_type = msg.get("instrumentGroup") or msg.get("board")
 
             if opcode == "authorize":
@@ -1883,7 +1447,6 @@ async def ws_stream(ws: WebSocket):
                 })
                 continue      
 
-            # Astras просит отписаться от подписки по guid
             if opcode == "unsubscribe":
                 unsub_guid = msg.get("guid") or req_guid
 
@@ -1916,8 +1479,6 @@ async def ws_stream(ws: WebSocket):
 
             # свечи (история + подписка). присылаются и открытые и закрытые свечи (confirm == 0,1)
             if opcode == "BarsGetAndSubscribe":
-                # Astras может переиспользовать один и тот же guid при смене инструмента в том же виджете.
-                # Поэтому если такой guid уже есть — останавливаем старую подписку и запускаем новую.
                 sub_guid = msg.get("guid") or req_guid
 
                 old = subs.pop(sub_guid, None)
@@ -2063,20 +1624,14 @@ async def ws_stream(ws: WebSocket):
             if opcode == "OrdersGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["orders"].append(stop)
-
                 exchange = msg.get("exchange") or "0"
                 portfolio = msg.get("portfolio") or "0"
-
                 statuses = msg.get("orderStatuses") or []
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
-
-                # Если Astras переиспользовал guid (например, при смене инструмента в том же виджете)
-                # — останавливаем старую подписку с этим guid и запускаем новую.
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
-
                 subs[sub_guid] = stop
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
                 data_format = msg.get("format")  #адаптер игнорирует
@@ -2095,7 +1650,6 @@ async def ws_stream(ws: WebSocket):
                     )
                     if payload.get("id") == "0" or payload.get("symbol") == "0" or payload.get("status") == "0":
                         return
-                    # orderStatuses по документации Astras влияет только на первичную историю
                     if apply_status_filter and statuses:
                         st = payload.get("status", "0")
                         if st not in statuses:
@@ -2106,20 +1660,14 @@ async def ws_stream(ws: WebSocket):
                 # Сначала запускается подписка и ждём подтверждение/ошибку от OKX
                 subscribed_evt = asyncio.Event()
                 error_evt = asyncio.Event()
-
-                # Пока отправляется историю, лайв события в буфер
-                # чтобы порядок был: ACK(200)  история  live
                 history_done = False
                 live_buffer: list[dict] = []
 
                 def _on_subscribed(_ev: dict):
                     subscribed_evt.set()
-
                 def _on_error(ev: dict):
-                    # OKX event:error -> Astras error (реальный code/msg) + close WS
                     error_evt.set()
                     return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
-
                 async def _on_live_order(o: dict, _guid: str):
                     nonlocal history_done
                     if not history_done:
@@ -2149,8 +1697,7 @@ async def ws_stream(ws: WebSocket):
                         unsub_args=unsub_args,
                     )
                 )
-
-                # Ждём либо subscribe, либо error (без таймаута)
+                # Ждём либо subscribe, либо error
                 done, pending = await asyncio.wait(
                     [
                         asyncio.create_task(subscribed_evt.wait()),
@@ -2161,11 +1708,9 @@ async def ws_stream(ws: WebSocket):
                 for t in pending:
                     t.cancel()
 
-                # Если была ошибка, _handle_okx_ws_error уже отправил ответ и закрыл WS
                 if error_evt.is_set():
                     raise WebSocketDisconnect
 
-                # Подписка подтверждена, отправляем ACK 200
                 await send_ack_200(sub_guid)
 
                 # REST history: orders-history (SPOT + FUTURES + SWAP)
@@ -2221,38 +1766,28 @@ async def ws_stream(ws: WebSocket):
             if opcode == "OrderBookGetAndSubscribe":
                 stop = asyncio.Event()
                 active["book"].append(stop)
-
                 code = msg.get("code")
                 depth = int(msg.get("depth", 20) or 20)
-
-                data_format = msg.get("format")  # Astras присылает всегда: "Simple"/"Slim"/...
+                data_format = msg.get("format")
                 data_format_norm = str(data_format).strip().lower()
-
                 frequency = msg.get("frequency")
                 try:
                     frequency = int(frequency) if frequency is not None else None
                 except Exception:
                     frequency = None
-
                 # если frequency не указан — ставим минимум по формату
                 min_freq = 10 if data_format_norm == "slim" else 25
-
                 if frequency is None:
                     frequency = min_freq
                 elif frequency < min_freq:
                     frequency = min_freq
 
-
                 sub_guid = msg.get("guid") or req_guid
-
-                # если Astras переиспользовал guid — остановим старую подписку с этим guid
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
 
                 subs[sub_guid] = stop
-
-                # эти поля Astras сейчас не влияют на OKX (оставляем как есть)
                 exchange = msg.get("exchange")  #адаптер игнорирует
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
 
@@ -2297,9 +1832,7 @@ async def ws_stream(ws: WebSocket):
 
                     def _on_subscribed(_ev: dict):
                         subscribed_evt.set()
-
                     def _on_error(ev: dict):
-                        # OKX event:error -> Astras error (реальный code/msg) + close WS
                         error_evt.set()
                         return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
 
@@ -2315,7 +1848,7 @@ async def ws_stream(ws: WebSocket):
                         )
                     )
 
-                    # Ждём либо subscribe, либо error (без таймаута)
+                    # Ждём либо subscribe, либо error
                     done, pending = await asyncio.wait(
                         [
                             asyncio.create_task(subscribed_evt.wait()),
@@ -2325,80 +1858,56 @@ async def ws_stream(ws: WebSocket):
                     )
                     for t in pending:
                         t.cancel()
-
-                    # Если была ошибка, _handle_okx_ws_error уже отправил ответ и закрыл WS
                     if error_evt.is_set():
                         raise WebSocketDisconnect
-
-                    # Подписка подтверждена, отправляем ACK 200
                     await send_ack_200(sub_guid)
-
                 continue
 
             # котировки инструмента (Astras Simple)
             if opcode == "QuotesSubscribe":
                 stop = asyncio.Event()
                 active["quotes"].append(stop)
-
                 code = msg.get("code")
                 instrument_group = msg.get("instrumentGroup")  #адаптер игнорирует
                 data_format = msg.get("format")  #адаптер игнорирует
-
                 frequency = msg.get("frequency")
                 try:
                     frequency = int(frequency) if frequency is not None else 25
                 except Exception:
                     frequency = 25
-
                 sub_guid = msg.get("guid") or req_guid
-                # если Astras переиспользовал guid — остановим старую подписку с этим guid
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
-
                 subs[sub_guid] = stop
                 exchange_out = "OKX"
-
                 symbol = code or (symbols[0] if symbols else "")
 
                 async def send_quote_astras(t: dict, _guid: str):
-
                     last_raw = t.get("last")
                     bid_raw = t.get("bid")
                     ask_raw = t.get("ask")
-
-                    # пока OKX не прислал реальные цены — ничего не отправляем
                     if last_raw is None and bid_raw is None and ask_raw is None:
                         return
                     now_ms = int(time.time() * 1000)
                     freq_ms = frequency if isinstance(frequency, int) else 25
-
                     prev_ms = last_sent_ms_quotes.get(_guid, 0)
                     if freq_ms > 0 and (now_ms - prev_ms) < freq_ms:
                         return
-
                     last_sent_ms_quotes[_guid] = now_ms
-
                     ts_ms = int(t.get("ts", 0) or 0)
                     ts_sec = int(ts_ms / 1000) if ts_ms else 0
-
                     last_price = last_raw or 0
                     bid = t.get("bid", 0) or 0
                     ask = t.get("ask", 0) or 0
-
                     bid_sz = t.get("bid_sz", 0) or 0
                     ask_sz = t.get("ask_sz", 0) or 0
-
                     high_price = t.get("high24h", 0) or 0
                     low_price = t.get("low24h", 0) or 0
                     open_price = t.get("open24h", 0) or 0
-                    # volume: в базовой валюте (OKX vol24h). Если OKX отдаёт дробь — отдаём дробь.
-                    volume = t.get("vol24h", 0) or 0
-
-                    # change / change_percent считаем строго от open24h (цена 24 часа назад).
-
+                    volume = t.get("vol24h", 0) or 0 # volume: в базовой валюте (OKX vol24h). Если OKX отдаёт дробь — отдаём дробь.
                     if open_price > 0:
-                        change = last_price - open_price
+                        change = last_price - open_price # change / change_percent считаем строго от open24h (цена 24 часа назад).
                         change_percent = (change / open_price) * 100.0
                     else:
                         change = 0.0
@@ -2411,8 +1920,7 @@ async def ws_stream(ws: WebSocket):
                         "prev_close_price": open_price,
                         "last_price": last_price,
                         "last_price_timestamp": ts_sec,
-                        # high/low: 24h high/low от OKX
-                        "high_price": high_price,
+                        "high_price": high_price, # high/low: 24h high/low от OKX
                         "low_price": low_price,
                         "accruedInt": 0,
                         "volume": volume,
@@ -2430,9 +1938,8 @@ async def ws_stream(ws: WebSocket):
                         "type": "0",
                         "total_bid_vol": 0,
                         "total_ask_vol": 0,
-                        "accrued_interest": 0,
-                        # change/change_percent зависят от prev_close_price; при null -> 0
-                        "change": change,
+                        "accrued_interest": 0,                       
+                        "change": change, # change/change_percent зависят от prev_close_price; при null -> 0
                         "change_percent": change_percent,
                     }
 
@@ -2440,18 +1947,12 @@ async def ws_stream(ws: WebSocket):
 
                 if symbol:
                     unsub_args = [{"channel": "tickers", "instId": symbol}]
-                    # Сначала запускается подписка и ждём подтверждение/ошибку от OKX
                     subscribed_evt = asyncio.Event()
                     error_evt = asyncio.Event()
-
-                    # Пока отправляется ACK, лайв события в буфер
-                    # чтобы порядок был: ACK(200)  live
                     history_done = False
                     live_buffer: list[dict] = []
-
                     def _on_subscribed(_ev: dict):
                         subscribed_evt.set()
-
                     def _on_error(ev: dict):
                         # OKX event:error -> Astras error (реальный code/msg) + close WS
                         error_evt.set()
@@ -2475,7 +1976,7 @@ async def ws_stream(ws: WebSocket):
                         )
                     )
 
-                    # Ждём либо subscribe, либо error (без таймаута)
+                    # Ждём либо subscribe, либо error
                     done, pending = await asyncio.wait(
                         [
                             asyncio.create_task(subscribed_evt.wait()),
@@ -2485,12 +1986,9 @@ async def ws_stream(ws: WebSocket):
                     )
                     for t in pending:
                         t.cancel()
-
-                    # Если была ошибка, _handle_okx_ws_error уже отправил ответ и закрыл WS
                     if error_evt.is_set():
                         raise WebSocketDisconnect
 
-                    # Подписка подтверждена, отправляем ACK 200
                     await send_ack_200(sub_guid)
 
                     # live-данные
@@ -2508,11 +2006,10 @@ async def ws_stream(ws: WebSocket):
             if opcode == "TradesGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["fills"].append(stop)
-                portfolio = msg.get("portfolio")  # у OKX виртуальный
+                portfolio = msg.get("portfolio")
                 exchange_out = "OKX"
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
-                # если Astras переиспользовал guid — остановим старую подписку
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
@@ -2545,7 +2042,7 @@ async def ws_stream(ws: WebSocket):
                         "commission": t.get("commission", 0) or 0,
                         "repoSpecificFields": None,
                         "settleDate": None,
-                        "volume": t.get("volume", 0) or 0, # volume / value = price * qty
+                        "volume": t.get("volume", 0) or 0, # volume = price * qty
                         "value": 0,
                     }
                     await safe_send_json({"data": payload, "guid": _guid})
@@ -2585,7 +2082,6 @@ async def ws_stream(ws: WebSocket):
                     )
                 )
 
-                # ждём реальный subscribe/error от OKX, и только потом шлём ACK(200)
                 if not await wait_okx_subscribed_or_error(subscribed_evt, error_evt, sub_guid, stop):
                     continue
                 await send_ack_200(sub_guid)
@@ -2613,7 +2109,6 @@ async def ws_stream(ws: WebSocket):
             if opcode == "PositionsGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["positions"].append(stop)
-                #exchange_out = "OKX"
                 exchange_out = "OKX"
                 portfolio = msg.get("portfolio")
                 portfolio_out = portfolio or "DEV_portfolio"
@@ -2621,7 +2116,6 @@ async def ws_stream(ws: WebSocket):
                 sub_guid = msg.get("guid") or req_guid
                 inst_type = msg.get("instrumentGroup") or msg.get("board")
                 inst_type_s = str(inst_type).strip().upper() if inst_type else None
-                # если Astras переиспользовал guid — остановим старую подписку
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
@@ -2629,12 +2123,11 @@ async def ws_stream(ws: WebSocket):
 
                 async def send_pos_astras(p: dict, existing_flag: bool, _guid: str):
                     symbol = p.get("symbol")
-                    # qtyUnits/avgPrice могут отсутствовать у OKX; тогда оставляем 0
                     qty_units_raw = p.get("qtyUnits")
                     avg_price_raw = p.get("avgPrice")
                     qty_units = float(qty_units_raw) if qty_units_raw is not None else 0.00
                     avg_price = float(avg_price_raw) if avg_price_raw is not None else 0
-                    volume = 0.00 # По текущей схеме для positions всегда отдаём 0
+                    volume = 0.00
                     current_volume = 0
 
                     payload = {
@@ -2669,13 +2162,11 @@ async def ws_stream(ws: WebSocket):
 
                     await safe_send_json({"data": payload, "guid": _guid})
 
-                # события подписки OKX
                 subscribed_evt = asyncio.Event()
                 error_evt = asyncio.Event()
-                # чтобы порядок был: ACK(200) -> snapshot -> live
                 history_done = False
                 live_buffer: list[dict] = []
-                # live
+
                 def _on_error(ev: dict):
                     error_evt.set()
                     return asyncio.create_task(_handle_okx_ws_error(sub_guid, ev))
@@ -2721,7 +2212,7 @@ async def ws_stream(ws: WebSocket):
                         pass
 
                 history_done = True
-                # live из буфера
+
                 if live_buffer:
                     for pos in live_buffer:
                         await send_pos_astras(pos, False, sub_guid)
@@ -2732,12 +2223,9 @@ async def ws_stream(ws: WebSocket):
             if opcode == "SummariesGetAndSubscribeV2":
                 stop = asyncio.Event()
                 active["summaries"].append(stop)
-
-                portfolio = msg.get("portfolio") or "0"
+                portfolio = msg.get("portfolio")
                 skip_history = bool(msg.get("skipHistory", False))
                 sub_guid = msg.get("guid") or req_guid
-
-                # если Astras переиспользовал guid — остановим старую подписку
                 old = subs.pop(sub_guid, None)
                 if old:
                     old.set()
@@ -2794,7 +2282,6 @@ async def ws_stream(ws: WebSocket):
                         return
                     await send_summary_astras(s, _guid)
 
-                # запуск подписки OKX (ошибки подписки должны приходить через on_error)
                 asyncio.create_task(
                     adapter.subscribe_summaries(
                         on_data=lambda s, _g=sub_guid: asyncio.create_task(_on_live_summary(s, _g)),
@@ -2805,7 +2292,6 @@ async def ws_stream(ws: WebSocket):
                     )
                 )
 
-                # ACK(200) только после реального subscribe от OKX
                 if not await wait_okx_subscribed_or_error(subscribed_evt, error_evt, sub_guid, stop):
                     continue
                 await send_ack_200(sub_guid)
