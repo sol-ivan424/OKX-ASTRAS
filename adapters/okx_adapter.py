@@ -69,6 +69,7 @@ class OkxAdapter:
         self._order_ws = None
         self._order_ws_lock = asyncio.Lock()
         self._order_ws_req_lock = asyncio.Lock()
+        self._order_ws_keepalive_task = None
 
         # WS для свечей у OKX идёт через /ws/v5/business (а не /public)
         # Иначе OKX отвечает 60018: Wrong URL or channel:candle..., instId ... doesn't exist
@@ -832,11 +833,36 @@ class OkxAdapter:
     async def _close_order_ws(self) -> None:
         ws = self._order_ws
         self._order_ws = None
+        task = self._order_ws_keepalive_task
+        self._order_ws_keepalive_task = None
+        current = asyncio.current_task()
+        if task is not None and task is not current:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
         if ws is not None:
             try:
                 await ws.close()
             except Exception:
                 pass
+
+    async def _order_ws_keepalive_loop(self, ws) -> None:
+        try:
+            while self._order_ws is ws:
+                await asyncio.sleep(15.0)
+                pong_waiter = await ws.ping()
+                await asyncio.wait_for(pong_waiter, timeout=5.0)
+        except Exception:
+            if self._order_ws is ws:
+                await self._close_order_ws()
+
+    def _start_order_ws_keepalive(self, ws) -> None:
+        task = self._order_ws_keepalive_task
+        if task is not None:
+            task.cancel()
+        self._order_ws_keepalive_task = asyncio.create_task(self._order_ws_keepalive_loop(ws))
 
     async def _ensure_order_ws(self):
         if self._order_ws is not None:
@@ -871,6 +897,7 @@ class OkxAdapter:
                 if msg.get("event") == "login":
                     if msg.get("code") == "0":
                         self._order_ws = ws
+                        self._start_order_ws_keepalive(ws)
                         return ws
                     try:
                         await ws.close()
