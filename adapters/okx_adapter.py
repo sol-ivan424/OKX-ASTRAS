@@ -22,15 +22,6 @@ class OkxAdapter:
         side_state: Dict[float, float],
         levels: List[Any],
     ) -> None:
-        """
-        OKX levels: [[price, sz, ...], ...]
-        - если sz == 0 -> уровень удаляется
-        - иначе уровень устанавливается/обновляется
-
-        Важно: OKX в update присылает только изменившиеся уровни.
-        Чтобы всегда отдавать полный стакан нужной глубины, мы храним локальный state
-        и применяем update как дельту.
-        """
         for lvl in levels or []:
             if not lvl:
                 continue
@@ -71,9 +62,6 @@ class OkxAdapter:
         self._order_ws_req_lock = asyncio.Lock()
         self._order_ws_keepalive_task = None
 
-        # WS для свечей у OKX идёт через /ws/v5/business (а не /public)
-        # Иначе OKX отвечает 60018: Wrong URL or channel:candle..., instId ... doesn't exist
-        # Для demo/simulated trading у OKX отдельный хост wspap.okx.com
         if self._demo:
             self._ws_candles_url = "wss://wspap.okx.com:8443/ws/v5/business"
             self._ws_public_url = "wss://wspap.okx.com:8443/ws/v5/public"
@@ -148,20 +136,11 @@ class OkxAdapter:
 
     #формирование подписи OKX для приватного REST запроса
     def _sign_request(self, timestamp: str, method: str, request_path: str, body: str) -> str:
-        """
-        Формирует подпись OKX для приватного запроса.
-
-        sign = Base64( HMAC_SHA256( timestamp + method + request_path + body ) )
-        """
         message = timestamp + method.upper() + request_path + body
         return self._hmac_sha256_base64(message)
 
     #базовые заголовки (demo mode)
     def _base_headers(self) -> Dict[str, str]:
-        """
-        Базовые заголовки.
-        Для demo OKX нужен заголовок x-simulated-trading: 1
-        """
         headers: Dict[str, str] = {}
         if self._demo:
             headers["x-simulated-trading"] = "1"
@@ -281,8 +260,6 @@ class OkxAdapter:
                     "instType": inst_type_item,
                     "type": inst_type_item,
                     "state": item.get("state"),
-                    # SPOT: baseCcy/quoteCcy
-                    # FUTURES/SWAP: у OKX quoteCcy часто пустой, валюты берём из settleCcy/ctValCcy
                     "baseCcy": item.get("baseCcy") or item.get("ctValCcy"),
                     "settleCcy": item.get("settleCcy"),
                     "quoteCcy": item.get("quoteCcy") or item.get("settleCcy"),
@@ -297,13 +274,7 @@ class OkxAdapter:
         return out
 
     async def _resolve_inst_id_code(self, symbol: str, inst_type: str) -> Optional[str]:
-        """
-        Возвращает instIdCode из отдельного кэша.
-        Кэш обновляется пакетно 3 запросами:
-        - instType=SPOT
-        - instType=FUTURES
-        - instType=SWAP
-        """
+
         sym = str(symbol or "").strip()
         if not sym:
             return None
@@ -352,7 +323,6 @@ class OkxAdapter:
     def _tf_to_okx_bar(self, tf: str) -> str:
         tf = str(tf).strip()
         mapping = {
-            # Astras может присылать таймфрейм как секунды (строкой)
             "1": "1s",
             "60": "1m",
             "180": "3m",
@@ -433,14 +403,6 @@ class OkxAdapter:
 
     #универсальный парсер стакана OKX (WS snapshot/update) в нейтральный формат
     def _parse_okx_order_book_any(self, symbol: str, item: Dict[str, Any], existing: bool) -> dict:
-        """
-        OKX books data item:
-        {
-          "bids": [["price","sz",...], ...],
-          "asks": [["price","sz",...], ...],
-          "ts": "1703862267800"
-        }
-        """
         ts_ms = self._to_int(item.get("ts"))
 
         bids_in = item.get("bids") or []
@@ -504,24 +466,6 @@ class OkxAdapter:
 
     #REST: котировка (tickers) — те же поля, что и WS tickers
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """
-        Возвращает котировку OKX через REST в нейтральном формате (как subscribe_quotes / WS tickers):
-        {
-          "symbol": "...",
-          "ts": <ms>,
-          "last": <float>,
-          "bid": <float>,
-          "ask": <float>,
-          "bid_sz": <float>,
-          "ask_sz": <float>,
-          "high24h": <float>,
-          "low24h": <float>,
-          "open24h": <float>,
-          "vol24h": <float>
-        }
-
-        OKX endpoint: /market/ticker?instId=...
-        """
         raw = await self._request_public(
             path="/market/ticker",
             params={"instId": symbol},
@@ -529,7 +473,6 @@ class OkxAdapter:
 
         items = raw.get("data") or []
         if not items:
-            # если данных нет — возвращаем нейтральный формат с нулями
             return {
                 "symbol": symbol,
                 "ts": 0,
@@ -548,11 +491,6 @@ class OkxAdapter:
 
     #REST: список котировок (tickers) — те же поля, что и WS tickers
     async def list_tickers(self, inst_type: str = "SPOT") -> List[Dict[str, Any]]:
-        """
-        Возвращает список котировок OKX через REST в нейтральном формате (как WS tickers).
-
-        OKX endpoint: /market/tickers?instType=...
-        """
         raw = await self._request_public(
             path="/market/tickers",
             params={"instType": inst_type},
@@ -566,19 +504,7 @@ class OkxAdapter:
 
     #REST: стакан (books) — снепшот (existing=True) в нейтральном формате как WS books
     async def get_order_book_rest(self, symbol: str, depth: int = 20) -> Dict[str, Any]:
-        """
-        Возвращает снепшот стакана OKX через REST в нейтральном формате (как subscribe_order_book):
-        {
-          "symbol": "...",
-          "ts": <ms>,
-          "bids": [(price, volume), ...],
-          "asks": [(price, volume), ...],
-          "existing": True
-        }
 
-        OKX endpoint: /market/books?instId=...&sz=...
-        sz = глубина (максимум зависит от OKX; обычно 1..400). Мы используем то, что просит Astras (например 10/20/50).
-        """
         # OKX REST books: sz обязателен и должен быть строкой/числом
         depth_i = int(depth) if depth is not None else 20
         if depth_i <= 0:
@@ -604,35 +530,8 @@ class OkxAdapter:
 
     #REST: снепшот котировки для формирования ответа на Astras REST /quotes
     async def get_quote_snapshot_rest(self, symbol: str, book_depth: int = 20) -> Dict[str, Any]:
-        """
-        Возвращает снепшот котировки OKX через REST в расширенном нейтральном формате для server.py.
-
-        Основа берётся из REST ticker (как get_ticker / WS tickers), плюс доп. поля из REST books:
-        - ob_ts: временная метка стакана (ms)
-        - total_bid_vol / total_ask_vol: сумма объёмов по уровням, полученным из REST books
-
-        Формат:
-        {
-          "symbol": "...",
-          "ts": <ms>,                 # timestamp тикера
-          "last": <float>,
-          "bid": <float>,
-          "ask": <float>,
-          "bid_sz": <float>,
-          "ask_sz": <float>,
-          "high24h": <float>,
-          "low24h": <float>,
-          "open24h": <float>,
-          "vol24h": <float>,          # объём в базовой валюте за 24ч
-          "ob_ts": <ms>,              # timestamp стакана (ms) или 0
-          "total_bid_vol": <float>,   # сумма size по bids из books (в базовой валюте)
-          "total_ask_vol": <float>    # сумма size по asks из books (в базовой валюте)
-        }
-        """
-        # 1) Тикер (REST /market/ticker) — те же поля, что и WS tickers
         t = await self.get_ticker(symbol)
 
-        # 2) Стакан (REST /market/books) — для ob_ts и суммарных объёмов
         try:
             ob = await self.get_order_book_rest(symbol, depth=book_depth)
         except Exception:
@@ -643,7 +542,6 @@ class OkxAdapter:
         bids = ob.get("bids") or []
         asks = ob.get("asks") or []
 
-        # Суммарные объёмы считаем строго по тем уровням, которые вернул OKX REST books.
         total_bid_vol = 0.0
         for _p, _v in bids:
             try:
@@ -658,7 +556,6 @@ class OkxAdapter:
             except Exception:
                 continue
 
-        # Возвращаем расширенный нейтральный формат для server.py
         return {
             **t,
             "ob_ts": ob_ts,
@@ -798,11 +695,7 @@ class OkxAdapter:
 
     #формирование payload login для приватного WS OKX
     def _ws_login_payload(self) -> Dict[str, Any]:
-        """
-        OKX WS login:
-        sign = Base64( HMAC_SHA256( timestamp + "GET" + "/users/self/verify" ) )
-        timestamp в секундах строкой
-        """
+
         if not self._api_key or not self._api_secret or not self._api_passphrase:
             raise RuntimeError("OKX API ключи не заданы")
 
@@ -963,11 +856,6 @@ class OkxAdapter:
 
     #парсер ордера OKX (REST и WS) в нейтральный формат
     def _parse_okx_order_any(self, d: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Нейтральный формат ордера:
-        id, symbol, type, side, status, price, qty, filled,
-        ts_create(ms), ts_update(ms), tif
-        """
 
         ord_id = d.get("ordId") or "0"
         inst_id = d.get("instId") or "0"
@@ -1025,7 +913,7 @@ class OkxAdapter:
             d.get("fillTime") if d.get("fillTime") is not None else d.get("ts")
         )
         if ts_ms <= 0:
-            # fallback: uTime/cTime, если fillTime/ts нет
+
             ts_ms = self._to_int(d.get("uTime") if d.get("uTime") is not None else d.get("cTime"))
 
         fee = d.get("fee")
@@ -1054,7 +942,7 @@ class OkxAdapter:
             "side": side,
             "price": fill_px,
             "qtyUnits": fill_sz,     # float
-            "qty": fill_sz,          # float, "Количество" по Astras
+            "qty": fill_sz,          # float
             "ts": ts_ms,
             "commission": commission,
             "feeCcy": fee_ccy,
@@ -1079,8 +967,6 @@ class OkxAdapter:
             return s or None
 
         it = _norm_inst_type(inst_type)
-
-        # Если inst_type не задан или не распознан — берём по всем основным типам
         if it == "SPOT":
             inst_types = ["SPOT", "MARGIN"]
         elif it in ("SWAP", "FUTURES", "MARGIN"):
@@ -1102,8 +988,6 @@ class OkxAdapter:
             raw = await self._request_private("GET", "/trade/orders-pending", params=params)
             for item in raw.get("data", []) or []:
                 out.append(self._parse_okx_order_any(item))
-
-        # сортируем по времени обновления
         out.sort(key=lambda x: int(x.get("ts_update", 0) or 0))
         return out
 
@@ -1124,8 +1008,6 @@ class OkxAdapter:
             return s or None
 
         it = _norm_inst_type(inst_type)
-
-        # Если inst_type не задан — берём по всем основным типам
         inst_types: List[str]
         if it is None:
             inst_types = ["SPOT", "SWAP", "FUTURES", "MARGIN"]
@@ -1152,7 +1034,7 @@ class OkxAdapter:
             for item in raw.get("data", []) or []:
                 out.append(self._parse_okx_order_any(item))
 
-        # сортируем по времени обновления
+
         out.sort(key=lambda x: int(x.get("ts_update", 0) or 0))
         return out
 
@@ -1399,10 +1281,7 @@ class OkxAdapter:
         ccy: Optional[str] = None,
         px: Optional[Any] = None,
     ) -> Dict[str, float]:
-        """
-        OKX REST: GET /api/v5/account/max-size
-        Возвращает maxBuy / maxSell в единицах размера заявки (sz).
-        """
+
         params: Dict[str, Any] = {
             "instId": str(inst_id),
             "tdMode": str(td_mode),
@@ -1427,10 +1306,7 @@ class OkxAdapter:
         mgn_mode: str,
         mgn_ccy: str,
     ) -> float:
-        """
-        OKX REST: GET /api/v5/account/max-loan
-        Возвращает максимально доступный заём по валюте.
-        """
+
         params: Dict[str, Any] = {
             "instId": str(inst_id),
             "mgnMode": str(mgn_mode),
@@ -1455,15 +1331,6 @@ class OkxAdapter:
         inst_type: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        """
-        Возвращает список исполнений в нейтральном формате.
-        OKX endpoint: /trade/fills-history
-        Возвращает историю за последние 3 месяца.
-        Важно:
-        - В запросе Astras TradesGetAndSubscribeV2 нет instType.
-          Если inst_type=None — считаем, что нужно взять историю по всему аккаунту,
-          и делаем запросы для SPOT + SWAP + FUTURES, объединяя результат.
-        """
 
         def _norm_inst_type(x: Optional[str]) -> Optional[str]:
             if x is None:
@@ -1473,14 +1340,14 @@ class OkxAdapter:
 
         it = _norm_inst_type(inst_type)
 
-        # Если inst_type не задан — берём по всем основным типам
+
         inst_types: List[str]
         if it is None:
             inst_types = ["SPOT", "SWAP", "FUTURES"]
         else:
             inst_types = [it]
 
-        # Собираем историю (без удаления дублей)
+
         out: List[Dict[str, Any]] = []
 
         for one_type in inst_types:
@@ -1491,7 +1358,7 @@ class OkxAdapter:
                 t = self._parse_okx_trade_any(item, is_history=True, inst_type=one_type)
                 out.append(t)
 
-        # сортируем по времени
+
         out.sort(key=lambda x: int(x.get("ts", 0) or 0))
         return out
 
@@ -1533,7 +1400,6 @@ class OkxAdapter:
                     login_deadline = asyncio.get_event_loop().time() + 5.0
                     while not authed and not stop_event.is_set():
                         if asyncio.get_event_loop().time() > login_deadline:
-                            # пробрасываем ошибку наружу, чтобы server.py отправил Astras error envelope
                             if on_error is not None:
                                 res = on_error({"event": "error", "code": None, "msg": "OKX WS login timeout"})
                                 if asyncio.iscoroutine(res):
@@ -1543,7 +1409,6 @@ class OkxAdapter:
                         raw = await ws.recv()
                         msg = json.loads(raw)
 
-                        # OKX может прислать event:error вместо event:login
                         if msg.get("event") == "error":
                             if on_error is not None:
                                 res = on_error(msg)
@@ -1555,7 +1420,6 @@ class OkxAdapter:
                             if msg.get("code") == "0":
                                 authed = True
                                 break
-                            # ошибка логина — отдаём реальный code/msg
                             if on_error is not None:
                                 res = on_error(msg)
                                 if asyncio.iscoroutine(res):
@@ -1600,7 +1464,7 @@ class OkxAdapter:
                         await self._ws_unsubscribe(ws, unsub_args)
 
             except Exception as e:
-                # если произошла нештатная ошибка до подтверждения подписки — пробрасываем наружу
+
                 if on_error is not None:
                     try:
                         res = on_error({"event": "error", "code": None, "msg": f"OKX adapter error: {e}"})
@@ -1621,18 +1485,9 @@ class OkxAdapter:
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
         unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """
-        Подписка на сделки (исполнения) OKX через приватный WS.
 
-        Используется private channel "orders": в сообщениях приходят fill-поля:
-        tradeId, fillPx, fillSz, fillTime, fee, feeCcy, ordId, instId, side.
-
-        Возвращает нейтральный формат для server.py (см. _parse_okx_trade_any).
-        Поле existing формируется в server.py, здесь есть флаг is_history=False.
-        """
         login_msg = self._ws_login_payload()
-        # instType может не прийти от Astras. Для OKX private channel `orders` он нужен.
-        # Если inst_type не задан — подписываемся сразу на все типы, чтобы получить все сделки по аккаунту.
+
         inst_type_u = str(inst_type).strip().upper() if inst_type else ""
         if inst_type_u in ("SPOT", "SWAP", "FUTURES"):
             inst_types = [inst_type_u]
@@ -1656,7 +1511,7 @@ class OkxAdapter:
                     login_deadline = asyncio.get_event_loop().time() + 5.0
                     while not authed and not stop_event.is_set():
                         if asyncio.get_event_loop().time() > login_deadline:
-                            # пробрасываем ошибку наружу, чтобы server.py отправил Astras error envelope
+
                             if on_error is not None:
                                 res = on_error({"event": "error", "code": None, "msg": "OKX WS login timeout"})
                                 if asyncio.iscoroutine(res):
@@ -1666,7 +1521,7 @@ class OkxAdapter:
                         raw = await ws.recv()
                         msg = json.loads(raw)
 
-                        # OKX может прислать event:error вместо event:login
+
                         if msg.get("event") == "error":
                             if on_error is not None:
                                 res = on_error(msg)
@@ -1714,12 +1569,10 @@ class OkxAdapter:
                             continue
 
                         for item in data:
-                            # сделка (исполнение) определяется наличием tradeId
                             trade_id = item.get("tradeId")
                             if not trade_id:
                                 continue
 
-                            # иногда приходит tradeId, но нет fillSz — отфильтруем пустые
                             fill_sz = self._to_float(item.get("fillSz"))
                             if fill_sz <= 0:
                                 continue
@@ -1755,21 +1608,7 @@ class OkxAdapter:
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
         unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """
-        Подписка на стакан OKX.
 
-        Возвращает нейтральный формат для server.py:
-        {
-          "symbol": "...",
-          "ts": <ms>,
-          "bids": [(price, volume), ...],
-          "asks": [(price, volume), ...],
-          "existing": True|False   # True только для snapshot
-        }
-
-        """
-
-        # OKX присылает action: snapshot / update
         sub_msg = {
             "op": "subscribe",
             "args": [
@@ -1821,26 +1660,21 @@ class OkxAdapter:
                         if not data:
                             continue
 
-                        # OKX обычно присылает список с одним элементом
+
                         for item in data:
-                            # timestamp стакана
+
                             ts_ms = self._to_int(item.get("ts"))
 
-                            # на snapshot мы полностью переинициализируем состояние
                             if is_snapshot:
                                 bids_state.clear()
                                 asks_state.clear()
 
-                            # применяем дельту update к локальному состоянию
                             self._apply_okx_book_delta(bids_state, item.get("bids") or [])
                             self._apply_okx_book_delta(asks_state, item.get("asks") or [])
 
-                            # формируем полный стакан из состояния
                             bids_full = sorted(bids_state.items(), key=lambda x: x[0], reverse=True)
                             asks_full = sorted(asks_state.items(), key=lambda x: x[0])
 
-                            # existing=True только для snapshot, existing=False для update,
-                            # но bids/asks всегда полные (после применения дельты)
                             book = {
                                 "symbol": symbol,
                                 "ts": ts_ms,
@@ -1870,22 +1704,7 @@ class OkxAdapter:
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
         unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """
-        Подписка на котировки OKX через WS tickers.
-        Возвращает нейтральный формат для server.py:
-        {
-          "symbol": "...",
-          "ts": <ms>,
-          "last": <float>,
-          "bid": <float>,
-          "ask": <float>,
-          "bid_sz": <float>,
-          "ask_sz": <float>,
-          "high24h": <float>,
-          "low24h": <float>,
-          "vol24h": <float>   # объём в базовой валюте за 24ч
-        }
-        """
+
 
         sub_msg = {
             "op": "subscribe",
@@ -1946,17 +1765,7 @@ class OkxAdapter:
 
     # REST: денежные остатки и SPOT-позиции
     async def get_account_balances(self) -> List[Dict[str, Any]]:
-        """
-        OKX REST /account/balance
-        Используется для SPOT:
-        - валютные остатки
-        - позиции по базовой валюте инструмента
 
-        Возвращает нейтральный формат:
-        {
-          ccy, cashBal, availBal, eq
-        }
-        """
         raw = await self._request_private("GET", "/account/balance")
 
         out: List[Dict[str, Any]] = []
@@ -1971,7 +1780,6 @@ class OkxAdapter:
         return out
 
     def _parse_okx_account_balance_any(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """OKX private WS/REST `account` channel/balance endpoint -> currency positions."""
         out: List[Dict[str, Any]] = []
         details = item.get("details") or []
         for d in details:
@@ -2007,7 +1815,6 @@ class OkxAdapter:
         pos = self._to_float(d.get("pos"))
         avg_px = self._to_float(d.get("avgPx"))
 
-        # OKX often provides markPx; last may be absent on private feed.
         cur_px_raw = d.get("markPx")
         if cur_px_raw is None:
             cur_px_raw = d.get("last")
@@ -2029,14 +1836,6 @@ class OkxAdapter:
         }
 
     async def get_positions_snapshot(self, inst_type: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Snapshot positions for Astras PositionsGetAndSubscribeV2.
-
-        Всегда возвращает:
-        - SPOT: валютные остатки (account/balance)
-        - MARGIN + FUTURES + SWAP: позиции по инструментам (account/positions)
-
-        inst_type из Astras игнорируется — по нашей схеме всегда отдаём все 3 типа.
-        """
 
         out: List[Dict[str, Any]] = []
 
@@ -2073,14 +1872,7 @@ class OkxAdapter:
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
         unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Private WS subscribe for positions.
 
-        We keep the WS connection alive and forward:
-        - `account` channel -> currency balances (isCurrency=True)
-        - `positions` channel (for FUTURES/SWAP) -> instrument positions (isCurrency=False)
-
-        `server.py` decides how to mark these as existing/live.
-        """
         inst_type_s = (str(inst_type).strip().upper() if inst_type else "SPOT")
 
         # OKX private channels must use private WS URL
@@ -2269,11 +2061,7 @@ class OkxAdapter:
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
         unsub_args: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Live-подписка для Summaries (нейтральный формат) через OKX private WS channel=account.
 
-        OKX не присылает отдельного "portfolio summary" канала — берём account updates.
-        Каждый update маппим в нейтральную сводку OKX и отдаём в server.py.
-        """
 
         self._assert_private_ws("account", self._ws_private_url)
 
@@ -2320,7 +2108,7 @@ class OkxAdapter:
 
                     await ws.send(json.dumps(sub_msg))
 
-                    # Ждём реальный event: subscribe от OKX, а не "заглушку"
+                    
                     subscribed = False
                     sub_deadline = asyncio.get_event_loop().time() + 5.0
                     while not subscribed and not stop_event.is_set():
@@ -2334,8 +2122,6 @@ class OkxAdapter:
                         m = json.loads(raw)
 
                         if m.get("event") == "subscribe":
-                            # summaries подтверждаем через on_subscribed, если оно передано
-                            # (server.py решает, нужно ли это Astras)
                             await _call(on_subscribed, m)
                             subscribed = True
                             break
