@@ -1,5 +1,5 @@
 
-В Astras заменить файл `market-settings-config.json` на версию из этого проекта.
+В Astras заменить файл `market-settings-config.json`, `default-dashboards-config.json` на версии из этого проекта.
 
 Необходимо добавить `.env` файл в корень проекта в таком формате:
 
