@@ -1,9 +1,9 @@
-```md
+
 В Astras заменить файл `market-settings-config.json` на версию из этого проекта.
 
 Необходимо добавить `.env` файл в корень проекта в таком формате:
 
-```env
+```md
 OKX_DEMO=1
 OKX_API_KEY=...
 OKX_API_SECRET=...
