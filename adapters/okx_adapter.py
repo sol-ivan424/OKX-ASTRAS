@@ -283,6 +283,7 @@ class OkxAdapter:
                     # SPOT: baseCcy/quoteCcy
                     # FUTURES/SWAP: у OKX quoteCcy часто пустой, валюты берём из settleCcy/ctValCcy
                     "baseCcy": item.get("baseCcy") or item.get("ctValCcy"),
+                    "settleCcy": item.get("settleCcy"),
                     "quoteCcy": item.get("quoteCcy") or item.get("settleCcy"),
                     "ctVal": ct_val,
                     "ctValCcy": item.get("ctValCcy"),
@@ -393,7 +394,7 @@ class OkxAdapter:
         return "candle" + bar
 
     #универсальный парсер свечи OKX (WS и REST)
-    def _parse_okx_candle_any(self, symbol: str, arr: list) -> dict:
+    def _parse_okx_candle_any(self, symbol: str, arr: list, inst_type: Optional[str] = None) -> dict:
 
         def _get(a, i, default=None):
             return a[i] if (a is not None and i < len(a)) else default
@@ -407,8 +408,13 @@ class OkxAdapter:
         h = self._to_float(h_raw) if h_raw is not None else None
         l = self._to_float(l_raw) if l_raw is not None else None
         c = self._to_float(c_raw) if c_raw is not None else None
+        inst_type_u = str(inst_type).upper().strip()
         vol_raw = _get(arr, 5, 0.0)
-        vol = self._to_float(vol_raw) if vol_raw is not None else 0.0
+        vol_ccy_raw = _get(arr, 6, None)
+        if inst_type_u in ("FUTURES", "SWAP") and vol_ccy_raw is not None:
+            vol = self._to_float(vol_ccy_raw)
+        else:
+            vol = self._to_float(vol_raw) if vol_raw is not None else 0.0
         # confirm может быть на 8 (WS) или на 7 (REST history-candles)
         confirm_raw = _get(arr, 8, _get(arr, 7, 0))
         confirm = self._to_int(confirm_raw)
@@ -665,6 +671,7 @@ class OkxAdapter:
         symbol: str,
         tf: str,
         from_ts: int,
+        inst_type: Optional[str] = None,
         limit_per_request: int = 100,
         max_requests: int = 20,
     ) -> List[dict]:
@@ -693,7 +700,7 @@ class OkxAdapter:
             oldest_ts_ms: Optional[int] = None
 
             for arr in rows:
-                b = self._parse_okx_candle_any(symbol, arr)
+                b = self._parse_okx_candle_any(symbol, arr, inst_type=inst_type)
                 ts_ms = int(b.get("ts", 0))
                 if ts_ms <= 0:
                     continue
@@ -731,6 +738,7 @@ class OkxAdapter:
         on_subscribed: Optional[Callable[[Dict[str, Any]], Any]] = None,
         on_error: Optional[Callable[[Dict[str, Any]], Any]] = None,
         unsub_args: Optional[List[Dict[str, Any]]] = None,
+        inst_type: Optional[str] = None,
     ) -> None:
         #публичный WS (public) для свечей
         channel = self._tf_to_okx_ws_channel(tf)
@@ -775,7 +783,7 @@ class OkxAdapter:
                             continue
 
                         for candle_arr in data:
-                            bar = self._parse_okx_candle_any(symbol, candle_arr)
+                            bar = self._parse_okx_candle_any(symbol, candle_arr, inst_type=inst_type)
                             res = on_data(bar)
                             if asyncio.iscoroutine(res):
                                 await res
