@@ -1,7 +1,7 @@
 
-В Astras заменить файлы `market-settings-config.json`, `default-dashboards-config.json`, `client-auth-context.service.ts` на версии из этого проекта.
+В Astras необходимо заменить файлы `market-settings-config.json`, `default-dashboards-config.json`, `client-auth-context.service.ts` на версии из этого проекта.
 
-Необходимо добавить `.env` файл в корень проекта в таком формате:
+Далее нужно добавить `.env` файл в корень проекта в таком формате:
 
 ```md
 OKX_DEMO=1
