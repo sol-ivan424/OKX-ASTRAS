@@ -1,4 +1,4 @@
-```md
+
 В Astras заменить файлы `market-settings-config.json`, `default-dashboards-config.json`, `client-auth-context.service.ts` на версии из этого проекта.
 
 Необходимо добавить `.env` файл в корень проекта в таком формате:
@@ -22,4 +22,4 @@ source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn api.server:app --host 127.0.0.1 --port 8000
 ```
-```
+
